@@ -7,7 +7,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional, Any
 import logging
 from supabase import create_client, Client
-import os
+import os   
 from dotenv import load_dotenv
 from flask_cors import CORS
 import json
@@ -24,21 +24,20 @@ from nltk.stem import WordNetLemmatizer
 import spacy
 from collections import Counter
 
-# Download required NLTK data
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
-    nltk.download('punkt')
+    nltk.download('punkt', quiet=True)
 
 try:
     nltk.data.find('corpora/stopwords')
 except LookupError:
-    nltk.download('stopwords')
+    nltk.download('stopwords', quiet=True)
 
 try:
     nltk.data.find('corpora/wordnet')
 except LookupError:
-    nltk.download('wordnet')
+    nltk.download('wordnet', quiet=True)
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers.*")
 
@@ -49,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app) 
+
+nltk_setup_done = False
 
 def convert_to_serializable(obj: Any) -> Any:
     """Convert non-serializable objects to JSON-serializable types"""
@@ -74,10 +75,14 @@ class SemanticSimilarityEngine:
     
     def __init__(self, model_name: str = 'thenlper/gte-large'):
         try:
+            cache_dir = os.getenv('TRANSFORMERS_CACHE', '/tmp/transformers_cache')
+            os.makedirs(cache_dir, exist_ok=True)
+            
             self.model = SentenceTransformer(
                 model_name,
                 device='cpu',
-                use_auth_token=False
+                use_auth_token=False,
+                cache_folder=cache_dir
             )
             if hasattr(self.model, 'eval'):
                 self.model.eval()
@@ -119,7 +124,6 @@ class SemanticSimilarityEngine:
             if embedding1.size == 0 or embedding2.size == 0:
                 return 0.0
             
-            # Ensure both embeddings are 1D arrays
             if embedding1.ndim > 1:
                 embedding1 = embedding1.flatten()
             if embedding2.ndim > 1:
@@ -1561,6 +1565,38 @@ except Exception as e:
     logger.error(f"Failed to initialize cosine similarity matcher: {e}")
     matcher = None
 
+
+@app.route('/', methods=['GET'])
+def root():
+    return jsonify({
+        'status': 'running',
+        'service': 'Semantic Matching API',
+        'version': '1.0.0',
+        'endpoints': {
+            'health': '/api/health',
+            'cosine_matching': '/api/cosine-matching (POST)',
+            'batch_applicants': '/api/batch-cosine-matching/applicants (POST)',
+            'batch_jobs': '/api/batch-cosine-matching/jobs (POST)',
+            'job_matching': '/api/cosine-matching/job/<job_id> (POST)',
+            'my_matches': '/api/my-cosine-matches (GET)',
+            'stats': '/api/cosine-stats (GET)'
+        }
+    })
+
+@app.route('/api', methods=['GET'])
+def api_root():
+    return jsonify({
+        'message': 'Semantic Matching API',
+        'available_endpoints': [
+            'POST /api/cosine-matching',
+            'POST /api/batch-cosine-matching/applicants', 
+            'POST /api/batch-cosine-matching/jobs',
+            'POST /api/cosine-matching/job/<job_id>',
+            'GET /api/my-cosine-matches',
+            'GET /api/cosine-stats',
+            'GET /api/health'
+        ]
+    })
 
 @app.route('/api/cosine-matching', methods=['POST'])
 def cosine_matching():
