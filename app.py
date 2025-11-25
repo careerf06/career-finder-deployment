@@ -73,7 +73,7 @@ def convert_to_serializable(obj: Any) -> Any:
 class SemanticSimilarityEngine:
     """Enhanced semantic similarity engine with manual cosine similarity"""
     
-    def __init__(self, model_name: str = 'thenlper/gte-large'):
+    def __init__(self, model_name: str = 'BAAI/bge-large-en-v1.5'):
         try:
             cache_dir = os.getenv('TRANSFORMERS_CACHE', '/tmp/transformers_cache')
             os.makedirs(cache_dir, exist_ok=True)
@@ -243,7 +243,7 @@ class STSConfig:
     """Configuration for Semantic Textual Similarity system"""
     
     def __init__(self):
-        self.model_name = os.getenv('STS_MODEL_NAME', 'thenlper/gte-large')
+        self.model_name = os.getenv('STS_MODEL_NAME', 'BAAI/bge-large-en-v1.5')
         self.similarity_threshold = float(os.getenv('STS_SIMILARITY_THRESHOLD', '0.5'))
         self.batch_size = int(os.getenv('STS_BATCH_SIZE', '64'))
         self.max_workers = int(os.getenv('STS_MAX_WORKERS', '4'))
@@ -291,7 +291,7 @@ class STSMetrics:
         }
 
 class JobApplicantMatcher:
-    def __init__(self, supabase_url: str, supabase_key: str, model_name: str = 'thenlper/gte-large'):
+    def __init__(self, supabase_url: str, supabase_key: str, model_name: str = 'BAAI/bge-large-en-v1.5'):
         """Initialize with Supabase connection and cosine similarity engine"""
         try:
             if not supabase_url or not supabase_key:
@@ -305,7 +305,7 @@ class JobApplicantMatcher:
             self.profile_cache = {}
             self.embedding_cache = {}
             self.cache_ttl = timedelta(minutes=0.5)
-            self.batch_size = 15
+            self.batch_size = 32
             self.max_workers = 8
             
             self.metrics = STSMetrics()
@@ -482,46 +482,171 @@ class JobApplicantMatcher:
             return False, "Profile description is too short for meaningful matching"
         else:
             return True, "Profile has sufficient data for matching"
+    def calculate_description_similarity(self, job: Dict, profile: Dict) -> float:
+        """
+        Description similarity WITHOUT penalizing applicant for missing description
+        """
+        try:
+            job_description = self._clean_text(job.get('description', '') or '')
+            applicant_description = self._clean_text(profile.get('description', '') or '')
+            
+            # Job description missing → neutral
+            if len(job_description) < 20:
+                logger.debug("Job description too short - neutral score applied")
+                return 0.0
 
-    def create_semantic_text_representation(self, profile: Dict, entity_type: str = "applicant") -> str:
-        """Create optimized semantic text representation with enhanced context"""
+            # Applicant description missing → DO NOT punish
+            if len(applicant_description) < 20:
+                logger.debug("Applicant description too short - no penalty applied")
+                return 0.0
+
+            description_similarity = self.semantic_engine.calculate_semantic_similarity(
+                job_description, 
+                applicant_description
+            )
+
+            logger.debug(f"Description similarity score: {description_similarity:.4f}")
+            return float(min(description_similarity, 1.0))
+            
+        except Exception as e:
+            logger.error(f"Error calculating description similarity: {e}")
+            return 0.0
+
+        
+    def calculate_enhanced_weighted_score(self, cosine_score: float, skill_score: float, 
+                             experience_score: float, description_score: float,
+                             job: Dict = None, profile: Dict = None) -> Dict[str, float]:
+        """
+        Adaptive weighted score based on job requirements complexity
+        """
+        try:
+            # Determine job complexity
+            has_many_requirements = False
+            if job:
+                job_requirements = job.get('requirements', [])
+                has_many_requirements = len(job_requirements) > 10
+            
+            # Check if experience score is valid
+            has_valid_experience = (
+                experience_score is not None and 
+                experience_score > 0.01
+            )
+            
+            # Adaptive weighting based on job type
+            if has_valid_experience:
+                if has_many_requirements:
+                    # Skill-heavy job
+                    weights = {
+                        'cosine': 0.45,
+                        'skill': 0.35,
+                        'description': 0.15,
+                        'experience': 0.05
+                    }
+                else:
+                    # Experience matters more
+                    weights = {
+                        'cosine': 0.45,
+                        'skill': 0.25,
+                        'description': 0.15,
+                        'experience': 0.15
+                    }
+                
+                primary_score = (
+                    weights['cosine'] * cosine_score +
+                    weights['skill'] * skill_score +
+                    weights['description'] * description_score +
+                    weights['experience'] * experience_score
+                )
+                experience_score_output = float(max(0.0, min(1.0, experience_score)))
+            else:
+                # No experience data
+                if has_many_requirements:
+                    weights = {
+                        'cosine': 0.60,
+                        'skill': 0.25,
+                        'description': 0.15
+                    }
+                else:
+                    weights = {
+                        'cosine': 0.60,
+                        'skill': 0.25,
+                        'description': 0.15
+                    }
+                
+                primary_score = (
+                    weights['cosine'] * cosine_score +
+                    weights['skill'] * skill_score +
+                    weights['description'] * description_score
+                )
+                experience_score_output = None
+            
+            # Apply sigmoid transformation for better score distribution
+            def sigmoid_transform(score):
+                """Spread scores better across 0-1 range"""
+                return 1 / (1 + np.exp(-8 * (score - 0.5)))
+            
+            transformed_score = sigmoid_transform(primary_score)
+            
+            return {
+                'similarity_score': float(max(0.0, min(1.0, transformed_score))),
+                'cosine_score': float(max(0.0, min(1.0, cosine_score))),
+                'skill_score': float(max(0.0, min(1.0, skill_score))),
+                'description_score': float(max(0.0, min(1.0, description_score))),
+                'experience_score': experience_score_output,
+                'weights_used': weights,
+                'raw_score': float(primary_score)
+            }
+        except Exception as e:
+            logger.error(f"Error calculating enhanced weighted score: {e}")
+            return {
+                'similarity_score': 0.0,
+                'cosine_score': 0.0,
+                'skill_score': 0.0,
+                'description_score': 0.0,
+                'experience_score': None
+            }
+    def create_semantic_text_representation(self, profile: Dict, entity_type: str = "applicant", job: Dict = None) -> str:
+        """
+        Context-aware semantic text representation
+        """
         try:
             if entity_type == "applicant":
                 skills = self._normalize_skills(profile.get('skills', []) or [])
-                parts = [
-                    f"Position: {profile.get('position', '')}",
-                    f"Company: {profile.get('company', '')}",
-                    f"Description: {self._clean_text(profile.get('description', ''))}",
-                    f"Skills: {', '.join(skills[:15])}",
-                    f"Industry: {profile.get('industry', '')}",
-                    f"Education: {profile.get('education', '')}"
-                ]
+                
+                # Determine emphasis based on job context
+                if job:
+                    job_desc_lower = job.get('description', '').lower()
+                    is_senior_role = any(term in job_desc_lower for term in ['senior', 'lead', 'principal', 'expert'])
+                    
+                    if is_senior_role:
+                        # Emphasize experience and advanced skills
+                        parts = [
+                            f"Professional Background: {self._clean_text(profile.get('description', ''))}",
+                            f"Core Expertise: {', '.join(skills[:12])}",
+                            f"Experience Level: {profile.get('experience_level', 'Professional')}"
+                        ]
+                    else:
+                        # Emphasize skills and potential
+                        parts = [
+                            f"Core Skills: {', '.join(skills[:15])}",
+                            f"Professional Background: {self._clean_text(profile.get('description', ''))}",
+                        ]
+                else:
+                    # Default balanced representation
+                    parts = [
+                        f"Description: {self._clean_text(profile.get('description', ''))}",
+                        f"Skills: {', '.join(skills[:15])}",
+                    ]
             else:
                 requirements = self._normalize_skills(profile.get('requirements', []) or [])
                 parts = [
-                    f"Title: {profile.get('title', '')}",
-                    f"Company: {profile.get('company_name', '')}",
                     f"Description: {self._clean_text(profile.get('description', ''))}",
                     f"Requirements: {', '.join(requirements[:12])}",
-                    f"Job Type: {profile.get('job_type', '')}",
-                    f"Industry: {profile.get('industry', '')}"
                 ]
             
-            valid_parts = []
-            for part in parts:
-                try:
-                    if ':' in part:
-                        key, value = part.split(':', 1)
-                        if value.strip():
-                            valid_parts.append(part)
-                    else:
-                        if part.strip():
-                            valid_parts.append(part)
-                except Exception as e:
-                    logger.warning(f"Error processing part '{part}': {e}")
-                    continue
-            
+            valid_parts = [part for part in parts if ':' in part and part.split(':', 1)[1].strip()]
             return " | ".join(valid_parts) if valid_parts else "No information available"
+            
         except Exception as e:
             logger.error(f"Error creating semantic text representation: {e}")
             return "Error in text representation"
@@ -646,9 +771,10 @@ class JobApplicantMatcher:
             return applicant_skills_normalized, []
 
     def create_filtered_semantic_text_representation(self, profile: Dict, job: Dict = None, 
-                                                     entity_type: str = "applicant") -> str:
+                                                 entity_type: str = "applicant") -> str:
         """
         Create semantic text representation using only matching skills when job context is provided
+        This ensures applicants are not penalized for having extra skills
         """
         try:
             if entity_type == "applicant" and job:
@@ -659,12 +785,8 @@ class JobApplicantMatcher:
                 matching_skills, _ = self.filter_matching_skills(job_requirements, all_skills)
                 
                 parts = [
-                    f"Position: {profile.get('position', '')}",
-                    f"Company: {profile.get('company', '')}",
                     f"Description: {self._clean_text(profile.get('description', ''))}",
                     f"Relevant Skills: {', '.join(matching_skills[:15])}",  # Only matching skills
-                    f"Industry: {profile.get('industry', '')}",
-                    f"Education: {profile.get('education', '')}"
                 ]
             else:
                 # Use original method for job or when no job context
@@ -677,82 +799,52 @@ class JobApplicantMatcher:
             logger.error(f"Error creating filtered semantic text: {e}")
             return self.create_semantic_text_representation(profile, entity_type)
 
-    def calculate_filtered_semantic_skill_similarity(self, job_requirements: List[str], 
-                                                     applicant_skills: List[str],
-                                                     include_non_matching: bool = False) -> Dict[str, float]:
+    def calculate_semantic_skill_similarity(self, job_requirements: List[str], applicant_skills: List[str]) -> float:
         """
-        Calculate skill similarity with detailed breakdown of matching vs non-matching skills
+        Enhanced skill similarity - multi-level matching
         """
+        if not job_requirements or not applicant_skills:
+            return 0.0
+        
         try:
             job_reqs = set(self._normalize_skills(job_requirements))
-            applicant_skills_normalized = self._normalize_skills(applicant_skills)
+            applicant_skills_set = set(self._normalize_skills(applicant_skills))
             
             if not job_reqs:
-                return {
-                    'overall_score': 0.0,
-                    'matching_skill_score': 0.0,
-                    'coverage_percentage': 0.0,
-                    'matching_skills_count': 0,
-                    'total_skills_count': len(applicant_skills_normalized)
-                }
+                return 0.0
             
-            # Separate matching and non-matching skills
-            matching_skills, non_matching_skills = self.filter_matching_skills(
-                list(job_reqs), applicant_skills_normalized
-            )
+            # Level 1: Exact matches (worth 1.0 each)
+            exact_matches = job_reqs.intersection(applicant_skills_set)
+            exact_coverage = len(exact_matches) / len(job_reqs)
             
-            # Calculate scores only for matching skills
-            if matching_skills:
-                matching_skills_text = " ".join(matching_skills[:20])
-                job_skills_text = " ".join(list(job_reqs)[:20])
+            # Level 2: Semantic matches for unmatched requirements
+            remaining_reqs = job_reqs - exact_matches
+            remaining_applicant_skills = applicant_skills_set - exact_matches
+            
+            semantic_match_scores = []
+            for req in remaining_reqs:
+                best_score = 0.0
+                for skill in remaining_applicant_skills:
+                    similarity = self.semantic_engine.calculate_semantic_similarity(req, skill)
+                    if similarity > best_score:
+                        best_score = similarity
                 
-                matching_cosine_score = self.semantic_engine.calculate_semantic_similarity(
-                    job_skills_text, matching_skills_text
-                )
-            else:
-                matching_cosine_score = 0.0
+                # Only count if similarity is above threshold
+                if best_score >= 0.65:
+                    semantic_match_scores.append(best_score)
             
-            # Calculate coverage based on matching skills only
-            exact_matches = len(set(matching_skills).intersection(job_reqs))
-            coverage = exact_matches / len(job_reqs) if job_reqs else 0
+            semantic_coverage = sum(semantic_match_scores) / len(job_reqs) if job_reqs else 0
             
-            # Calculate Jaccard for matching skills only
-            if matching_skills:
-                intersection = len(set(matching_skills).intersection(job_reqs))
-                union = len(set(matching_skills).union(job_reqs))
-                jaccard = intersection / union if union > 0 else 0.0
-            else:
-                jaccard = 0.0
+            # Combined score with higher weight on exact matches
+            combined_score = (0.65 * exact_coverage) + (0.35 * semantic_coverage)
             
-            # Combined score emphasizing matching skills
-            if include_non_matching and non_matching_skills:
-                # Slight penalty for having many non-matching skills
-                noise_penalty = 1.0 - (len(non_matching_skills) / (len(matching_skills) + len(non_matching_skills)) * 0.1)
-                combined_score = (0.4 * coverage + 0.4 * matching_cosine_score + 0.2 * jaccard) * noise_penalty
-            else:
-                combined_score = 0.5 * coverage + 0.3 * matching_cosine_score + 0.2 * jaccard
+            logger.debug(f"Skill matching: exact={exact_coverage:.2f}, semantic={semantic_coverage:.2f}, final={combined_score:.2f}")
             
-            return {
-                'overall_score': float(min(combined_score, 1.0)),
-                'matching_skill_score': float(matching_cosine_score),
-                'coverage_percentage': float(coverage * 100),
-                'jaccard_similarity': float(jaccard),
-                'matching_skills_count': len(matching_skills),
-                'non_matching_skills_count': len(non_matching_skills),
-                'total_skills_count': len(applicant_skills_normalized),
-                'exact_matches': exact_matches,
-                'required_skills_count': len(job_reqs)
-            }
+            return float(min(combined_score, 1.0))
             
         except Exception as e:
-            logger.error(f"Error in filtered skill similarity: {e}")
-            return {
-                'overall_score': 0.0,
-                'matching_skill_score': 0.0,
-                'coverage_percentage': 0.0,
-                'matching_skills_count': 0,
-                'total_skills_count': 0
-            }
+            logger.error(f"Error calculating semantic skill similarity: {e}")
+            return 0.0
 
     def calculate_comprehensive_cosine_similarity_with_skill_filtering(
         self, jobs: List[Dict], profile: Dict) -> List[Dict]:
@@ -809,7 +901,23 @@ class JobApplicantMatcher:
         except Exception as e:
             logger.error(f"Error in filtered cosine similarity calculation: {e}")
             return [{'cosine_score': 0.0, 'skill_breakdown': {}} for _ in jobs]
-
+    def get_skill_matching_details(self, job_requirements: List[str], applicant_skills: List[str]) -> Dict:
+        """Get detailed breakdown of how applicant skills match job requirements"""
+        job_reqs = set(self._normalize_skills(job_requirements))
+        app_skills = set(self._normalize_skills(applicant_skills))
+        
+        matched = job_reqs.intersection(app_skills)
+        unmatched_requirements = job_reqs - app_skills
+        extra_skills = app_skills - job_reqs
+        
+        return {
+            'matched_requirements': list(matched),
+            'unmatched_requirements': list(unmatched_requirements),
+            'extra_skills': list(extra_skills),
+            'requirements_coverage': len(matched) / len(job_reqs) if job_reqs else 0,
+            'total_requirements': len(job_reqs),
+            'total_applicant_skills': len(app_skills)
+        }
     def perform_filtered_matching_applicant_to_jobs(self, user_id: str, 
                                                 threshold: float = 0.5,
                                                 save_to_db: bool = True) -> Dict[str, Any]:
@@ -869,7 +977,7 @@ class JobApplicantMatcher:
                 cosine_score = result['cosine_score']
                 skill_breakdown = result['skill_breakdown']
                 
-                if cosine_score < threshold * 0.5:
+                if cosine_score < threshold:
                     continue
                 
                 # Use the filtered skill score
@@ -946,40 +1054,44 @@ class JobApplicantMatcher:
             job_exp = self._extract_experience_from_job(job)
             applicant_exp = self._extract_experience_from_profile(profile)
             
+            # Check if data exists
+            job_has_data = bool(job_exp.get('level') or job_exp.get('years', 0) > 0 or 
+                            (job_exp.get('description', '').strip() and len(job_exp.get('description', '').strip()) > 20))
+            applicant_has_data = bool(applicant_exp.get('level') or applicant_exp.get('years', 0) > 0 or
+                                    (applicant_exp.get('description', '').strip() and len(applicant_exp.get('description', '').strip()) > 20))
+            
             analysis = {
                 'job_requirements': {
-                    'level': job_exp.get('level', 'Not specified'),
-                    'years': job_exp.get('years', 'Not specified'),
-                    'has_requirements': bool(job_exp.get('level') or job_exp.get('years', 0) > 0)
+                    'level': job_exp.get('level', 'Not specified') if job_has_data else 'No data',
+                    'years': job_exp.get('years', 'Not specified') if job_has_data else 'No data',
+                    'has_requirements': job_has_data
                 },
                 'applicant_qualifications': {
-                    'level': applicant_exp.get('level', 'Not specified'),
-                    'years': applicant_exp.get('years', 'Not specified'),
-                    'has_experience': bool(applicant_exp.get('level') or applicant_exp.get('years', 0) > 0)
+                    'level': applicant_exp.get('level', 'Not specified') if applicant_has_data else 'No data',
+                    'years': applicant_exp.get('years', 'Not specified') if applicant_has_data else 'No data',
+                    'has_experience': applicant_has_data
                 },
-                'compatibility': 'Good'
+                'compatibility': 'Not evaluated - insufficient data'
             }
             
-            # Determine compatibility
-            if not analysis['job_requirements']['has_requirements']:
-                analysis['compatibility'] = 'No specific requirements'
-            elif not analysis['applicant_qualifications']['has_experience']:
-                analysis['compatibility'] = 'Limited experience information'
+            # Only determine compatibility if BOTH have data
+            if not job_has_data or not applicant_has_data:
+                return analysis
+            
+            # Simple compatibility check
+            job_level = (job_exp.get('level', '') or '').lower()
+            applicant_level = (applicant_exp.get('level', '') or '').lower()
+            
+            level_mapping = {'entry': 1, 'junior': 1, 'mid': 2, 'senior': 3, 'expert': 4}
+            job_score = level_mapping.get(job_level, 2)
+            applicant_score = level_mapping.get(applicant_level, 2)
+            
+            if applicant_score >= job_score:
+                analysis['compatibility'] = 'Meets or exceeds requirements'
+            elif applicant_score >= job_score - 1:
+                analysis['compatibility'] = 'Partially meets requirements'
             else:
-                # Simple compatibility check
-                job_level = (job_exp.get('level', '') or '').lower()
-                applicant_level = (applicant_exp.get('level', '') or '').lower()
-                
-                level_mapping = {'entry': 1, 'junior': 1, 'mid': 2, 'senior': 3, 'expert': 4}
-                job_score = level_mapping.get(job_level, 2)
-                applicant_score = level_mapping.get(applicant_level, 2)
-                
-                if applicant_score >= job_score:
-                    analysis['compatibility'] = 'Meets or exceeds requirements'
-                elif applicant_score >= job_score - 1:
-                    analysis['compatibility'] = 'Partially meets requirements'
-                else:
-                    analysis['compatibility'] = 'Below requirements'
+                analysis['compatibility'] = 'Below requirements'
             
             return analysis
             
@@ -990,231 +1102,128 @@ class JobApplicantMatcher:
                 'applicant_qualifications': {'level': 'Error', 'years': 'Error', 'has_experience': False},
                 'compatibility': 'Error in analysis'
             }
-    # ==================== END OF NEW SKILL FILTERING METHODS ====================
 
     def calculate_comprehensive_cosine_similarity_applicant_to_jobs(self, jobs: List[Dict], profile: Dict) -> List[float]:
-        """Calculate comprehensive cosine similarity between jobs and profile - OPTIMIZED"""
+        """Calculate comprehensive cosine similarity between jobs and profile - ONE JOB AT A TIME"""
         if not jobs or not profile:
             return []
             
         try:
-            # Generate profile embedding ONCE
+            # Generate profile embedding once (reused for all jobs)
             profile_text = self.create_semantic_text_representation(profile, "applicant")
-            logger.info(f"Generating semantic embedding for 1 profile...")
+            logger.info(f"Generating profile embedding...")
             profile_embedding = self.semantic_engine.get_semantic_embedding(profile_text)
             
             if profile_embedding.size == 0:
                 logger.warning("No profile embedding generated")
                 return [0.0] * len(jobs)
             
-            logger.info("Calculating comprehensive cosine similarity for each job...")
+            logger.info(f"Profile embedding generated. Starting matching for {len(jobs)} jobs...")
+            
             similarity_scores = []
             
-            # Process jobs one by one to avoid batch embedding generation
-            for job in jobs:
-                job_text = self.create_semantic_text_representation(job, "job")
-                job_embedding = self.semantic_engine.get_semantic_embedding(job_text)
+            # Process each job individually
+            for idx, job in enumerate(jobs):
+                job_num = idx + 1
+                job_title = job.get('title', 'Unknown Title')
                 
-                if job_embedding.size == 0:
-                    similarity_scores.append(0.0)
-                    continue
+                try:
+                    # Log START of processing this job
+                    logger.info(f"Processing job {job_num}/{len(jobs)}: '{job_title}'")
                     
-                similarity = self.semantic_engine.calculate_cosine_similarity(
-                    job_embedding, profile_embedding
-                )
-                similarity_scores.append(similarity)
+                    # Generate embedding for this specific job
+                    job_text = self.create_semantic_text_representation(job, "job")
+                    job_embedding = self.semantic_engine.get_semantic_embedding(job_text)
+                    
+                    if job_embedding.size == 0:
+                        logger.warning(f"Job {job_num}/{len(jobs)}: No embedding generated - Score: 0.0000")
+                        similarity_scores.append(0.0)
+                        continue
+                    
+                    # Calculate similarity for this job
+                    similarity = self.semantic_engine.calculate_cosine_similarity(
+                        job_embedding, profile_embedding
+                    )
+                    similarity_scores.append(similarity)
+                    
+                    # Log COMPLETION of this job with score
+                    logger.info(f"Completed job {job_num}/{len(jobs)}: '{job_title}' - Score: {similarity:.4f}")
+                    
+                except Exception as job_error:
+                    logger.error(f"Error processing job {job_num}/{len(jobs)}: {job_error}")
+                    similarity_scores.append(0.0)
             
-            if len(similarity_scores) != len(jobs):
-                logger.warning(f"Score count mismatch: {len(similarity_scores)} scores for {len(jobs)} jobs")
-                if len(similarity_scores) < len(jobs):
-                    similarity_scores.extend([0.0] * (len(jobs) - len(similarity_scores)))
-                else:
-                    similarity_scores = similarity_scores[:len(jobs)]
+            logger.info(f"All {len(jobs)} jobs processed. Similarity calculation complete.")
             
             return similarity_scores
+            
         except Exception as e:
             logger.error(f"Error in comprehensive cosine similarity calculation: {e}")
             return [0.0] * len(jobs) if jobs else []
-        
-    def perform_optimized_cosine_matching_applicant_to_jobs(self, user_id: str, threshold: float = 0.5, save_to_db: bool = True) -> Dict[str, Any]:
-        """Optimized cosine similarity matching - one applicant to all jobs with sequential processing"""
-        start_time = time.time()
-        
-        try:
-            jobs = self.get_job_postings()
-            profile = self.get_applicant_profile(user_id)
-            
-            if not jobs:
-                logger.warning("No jobs found for cosine similarity matching")
-                return {
-                    'matches': [],
-                    'insufficient_data': False,
-                    'message': 'No active job postings available for matching',
-                    'total_matches': 0
-                }
-
-            if not profile:
-                logger.warning(f"No profile found for user {user_id}")
-                return {
-                    'matches': [],
-                    'insufficient_data': True,
-                    'message': 'No applicant profile found',
-                    'total_matches': 0
-                }
-
-            has_sufficient_data, data_message = self.has_sufficient_profile_data(profile)
-            
-            if not has_sufficient_data:
-                logger.warning(f"Applicant {user_id} has insufficient data: {data_message}")
-                return {
-                    'matches': [],
-                    'insufficient_data': True,
-                    'message': data_message,
-                    'total_matches': 0
-                }
-            
-            logger.info(f"Starting OPTIMIZED cosine similarity matching for user {user_id} with {len(jobs)} jobs")
-            
-            # Generate profile embedding ONCE
-            profile_text = self.create_semantic_text_representation(profile, "applicant")
-            logger.info("Generating semantic embedding for applicant profile...")
-            profile_embedding = self.semantic_engine.get_semantic_embedding(profile_text)
-            
-            if profile_embedding.size == 0:
-                logger.warning("No profile embedding generated")
-                return {
-                    'matches': [],
-                    'insufficient_data': False,
-                    'message': 'No profile embedding could be generated',
-                    'total_matches': 0
-                }
-            
-            matches = []
-            
-            # Process each job sequentially
-            for job in jobs:
-                # Generate job embedding for this specific job
-                job_text = self.create_semantic_text_representation(job, "job")
-                job_embedding = self.semantic_engine.get_semantic_embedding(job_text)
-                
-                if job_embedding.size == 0:
-                    continue
-                    
-                # Calculate cosine similarity
-                cosine_score = self.semantic_engine.calculate_cosine_similarity(job_embedding, profile_embedding)
-                
-                if cosine_score < threshold * 0.5:
-                    continue
-                    
-                # Calculate additional scores
-                skill_score = self.calculate_semantic_skill_similarity(
-                    job.get('requirements', []),
-                    profile.get('skills', [])
-                )
-
-                experience_score = self.calculate_experience_similarity(job, profile)
-
-                scores = self.calculate_cosine_weighted_score(cosine_score, skill_score, experience_score)
-                                
-                if scores['similarity_score'] >= threshold:
-                    match_strength = self.get_cosine_match_strength(scores['similarity_score'])
-                    
-                    match_data = {
-                        'job_id': job['id'],
-                        'applicant_id': user_id,
-                        'scores': scores,
-                        'job_title': job.get('title', 'Unknown Title'),
-                        'job_company': job.get('company_name', 'Unknown Company'),
-                        'match_strength': match_strength,
-                        'analysis': {
-                            'cosine_interpretation': self.interpret_cosine_match(scores),
-                            'key_strengths': self.identify_key_strengths(scores, job, profile),
-                            'improvement_areas': self.identify_improvement_areas(scores, job, profile)
-                        }
-                    }
-                    matches.append(match_data)
-                    
-                    # Save each match immediately to Supabase
-                    if save_to_db:
-                        try:
-                            self.save_single_match_to_db(match_data, user_id=user_id)
-                            logger.info(f"Saved match for job {job['id']} with score {scores['similarity_score']:.4f}")
-                        except Exception as save_error:
-                            logger.error(f"Failed to save match for job {job['id']}: {save_error}")
-            
-            # Sort matches by similarity score
-            sorted_matches = sorted(matches, key=lambda x: x['scores']['similarity_score'], reverse=True)
-            
-            processing_time = time.time() - start_time
-            logger.info(f"Optimized cosine similarity matching completed in {processing_time:.2f}s. Found {len(sorted_matches)} matches.")
-            
-            return {
-                'matches': sorted_matches,
-                'insufficient_data': False,
-                'message': f'Found {len(sorted_matches)} matches',
-                'total_matches': len(sorted_matches),
-                'processing_time': processing_time
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in optimized cosine similarity matching: {e}")
-            return {
-                'matches': [],
-                'insufficient_data': False,
-                'message': f'Error during matching: {str(e)}',
-                'total_matches': 0
-            }
 
     def calculate_comprehensive_cosine_similarity_job_to_applicants(self, applicants: List[Dict], job: Dict) -> List[float]:
-        """Calculate comprehensive cosine similarity between applicants and job"""
+        """Calculate comprehensive cosine similarity between applicants and job - ONE APPLICANT AT A TIME"""
         if not applicants or not job:
             return []
             
         try:
-            applicant_texts = [self.create_semantic_text_representation(applicant, "applicant") for applicant in applicants]
+            # Generate job embedding once (reused for all applicants)
             job_text = self.create_semantic_text_representation(job, "job")
-            
-            logger.info(f"Generating semantic embeddings for {len(applicant_texts)} applicants and job...")
-            
-            applicant_embeddings = self.batch_encode_texts(applicant_texts, batch_size=64)
-            
-            if applicant_embeddings.size == 0:
-                logger.warning("No applicant embeddings generated")
-                return [0.0] * len(applicants)
-            
+            logger.info(f"Generating job embedding...")
             job_embedding = self.semantic_engine.get_semantic_embedding(job_text)
             
             if job_embedding.size == 0:
                 logger.warning("No job embedding generated")
                 return [0.0] * len(applicants)
             
-            logger.info("Calculating comprehensive cosine similarity...")
+            logger.info(f"Job embedding generated. Starting matching for {len(applicants)} applicants...")
+            
             similarity_scores = []
             
-            for i in range(len(applicant_embeddings)):
-                if i < len(applicant_embeddings):
-                    applicant_embedding = applicant_embeddings[i]
+            # Process each applicant individually
+            for idx, applicant in enumerate(applicants):
+                applicant_num = idx + 1
+                applicant_name = f"{applicant.get('first_name', '')} {applicant.get('last_name', '')}".strip() or f"Applicant {applicant.get('id', 'Unknown')}"
+                
+                try:
+                    # Log START of processing this applicant
+                    logger.info(f"Processing applicant {applicant_num}/{len(applicants)}: '{applicant_name}'")
+                    
+                    # Generate embedding for this specific applicant
+                    applicant_text = self.create_semantic_text_representation(applicant, "applicant")
+                    applicant_embedding = self.semantic_engine.get_semantic_embedding(applicant_text)
+                    
+                    if applicant_embedding.size == 0:
+                        logger.warning(f"Applicant {applicant_num}/{len(applicants)}: No embedding generated - Score: 0.0000")
+                        similarity_scores.append(0.0)
+                        continue
+                    
+                    # Calculate similarity for this applicant
                     similarity = self.semantic_engine.calculate_cosine_similarity(
                         applicant_embedding, job_embedding
                     )
                     similarity_scores.append(similarity)
-                else:
+                    
+                    # Log COMPLETION of this applicant with score
+                    logger.info(f"Completed applicant {applicant_num}/{len(applicants)}: '{applicant_name}' - Score: {similarity:.4f}")
+                    
+                except Exception as applicant_error:
+                    logger.error(f"Error processing applicant {applicant_num}/{len(applicants)}: {applicant_error}")
                     similarity_scores.append(0.0)
             
-            if len(similarity_scores) != len(applicants):
-                logger.warning(f"Score count mismatch: {len(similarity_scores)} scores for {len(applicants)} applicants")
-                if len(similarity_scores) < len(applicants):
-                    similarity_scores.extend([0.0] * (len(applicants) - len(similarity_scores)))
-                else:
-                    similarity_scores = similarity_scores[:len(applicants)]
+            logger.info(f"All {len(applicants)} applicants processed. Similarity calculation complete.")
             
             return similarity_scores
+            
         except Exception as e:
             logger.error(f"Error in comprehensive cosine similarity calculation: {e}")
             return [0.0] * len(applicants) if applicants else []
 
     def calculate_semantic_skill_similarity(self, job_requirements: List[str], applicant_skills: List[str]) -> float:
-        """Calculate semantic skill similarity using cosine similarity"""
+        """
+        Calculate semantic skill similarity using cosine similarity - NO PENALTY for extra applicant skills
+        Only measures how well the applicant covers job requirements
+        """
         if not job_requirements or not applicant_skills:
             return 0.0
         
@@ -1225,40 +1234,173 @@ class JobApplicantMatcher:
             if not job_reqs:
                 return 0.0
             
+            # Calculate coverage: what % of job requirements does the applicant have?
+            # NO PENALTY for having additional skills beyond requirements
             intersection = len(job_reqs.intersection(applicant_skills_set))
-            union = len(job_reqs.union(applicant_skills_set))
-            jaccard_similarity = intersection / union if union > 0 else 0.0
+            coverage = intersection / len(job_reqs) if job_reqs else 0
             
-            job_skills_text = " ".join(list(job_reqs)[:20]) 
-            applicant_skills_text = " ".join(list(applicant_skills_set)[:20])
+            # For semantic comparison, only compare against job requirements
+            # Don't include extra applicant skills in the comparison
+            job_skills_text = " ".join(list(job_reqs)[:20])
+            
+            # Only use applicant skills that are relevant to job requirements
+            # This prevents dilution from irrelevant extra skills
+            matching_applicant_skills = list(job_reqs.intersection(applicant_skills_set))[:20]
+            
+            # If no exact matches, use all applicant skills for semantic comparison
+            # but weight coverage heavily
+            if matching_applicant_skills:
+                applicant_skills_text = " ".join(matching_applicant_skills)
+            else:
+                applicant_skills_text = " ".join(list(applicant_skills_set)[:20])
             
             cosine_similarity_score = self.semantic_engine.calculate_semantic_similarity(
                 job_skills_text, applicant_skills_text
             )
             
-            coverage = intersection / len(job_reqs) if job_reqs else 0
+            # Modified Jaccard: only based on coverage of requirements, not union
+            # This removes penalty for extra skills
+            jaccard_similarity = coverage  # Same as coverage since we only care about job reqs
             
-            combined_score = (0.4 * coverage) + (0.4 * cosine_similarity_score) + (0.2 * jaccard_similarity)
+            # Weighted combination emphasizing coverage of required skills
+            # Higher weight on coverage ensures extra skills don't hurt the score
+            combined_score = (0.5 * coverage) + (0.4 * cosine_similarity_score) + (0.1 * jaccard_similarity)
             
             return float(min(combined_score, 1.0))
+            
         except Exception as e:
             logger.error(f"Error calculating semantic skill similarity: {e}")
             return 0.0
 
-    def calculate_experience_similarity(self, job: Dict, profile: Dict) -> float:
-        """Calculate experience similarity using cosine similarity with proper None handling"""
+    def calculate_filtered_semantic_skill_similarity(self, job_requirements: List[str], 
+                                                 applicant_skills: List[str],
+                                                 include_non_matching: bool = False) -> Dict[str, float]:
+        """
+        Calculate skill similarity with detailed breakdown - NO PENALTY for extra skills
+        
+        Args:
+            job_requirements: List of required skills for the job
+            applicant_skills: List of skills the applicant has
+            include_non_matching: Whether to include non-matching skills in the score calculation
+        
+        Returns:
+            Dictionary with detailed skill matching scores
+        """
+        if not job_requirements or not applicant_skills:
+            return {
+                'overall_score': 0.0,
+                'coverage_score': 0.0,
+                'semantic_score': 0.0,
+                'exact_match_score': 0.0,
+                'coverage_percentage': 0.0,
+                'exact_matches': 0,
+                'semantic_matches': 0,
+                'total_requirements': len(job_requirements) if job_requirements else 0
+            }
+        
+        try:
+            job_reqs_normalized = set(self._normalize_skills(job_requirements))
+            applicant_skills_normalized = self._normalize_skills(applicant_skills)
+            
+            if not job_reqs_normalized:
+                return {'overall_score': 0.0, 'coverage_percentage': 0.0}
+            
+            # Exact matches
+            exact_matches = []
+            for skill in applicant_skills_normalized:
+                if skill in job_reqs_normalized:
+                    exact_matches.append(skill)
+            
+            # Semantic matches (for skills that don't exactly match)
+            semantic_matches = []
+            remaining_job_reqs = job_reqs_normalized - set(exact_matches)
+            remaining_applicant_skills = [s for s in applicant_skills_normalized if s not in exact_matches]
+            
+            for job_req in remaining_job_reqs:
+                best_match_score = 0.0
+                best_match_skill = None
+                
+                for applicant_skill in remaining_applicant_skills:
+                    similarity = self.semantic_engine.calculate_semantic_similarity(
+                        job_req, applicant_skill
+                    )
+                    if similarity > best_match_score:
+                        best_match_score = similarity
+                        best_match_skill = applicant_skill
+                
+                if best_match_score >= 0.6:  # Threshold for semantic match
+                    semantic_matches.append({
+                        'job_requirement': job_req,
+                        'applicant_skill': best_match_skill,
+                        'similarity': best_match_score
+                    })
+            
+            # Calculate coverage based ONLY on job requirements (no penalty for extra skills)
+            total_matched = len(exact_matches) + len(semantic_matches)
+            coverage_score = total_matched / len(job_reqs_normalized)
+            coverage_percentage = coverage_score * 100
+            
+            # Exact match score (what % of requirements are exactly matched)
+            exact_match_score = len(exact_matches) / len(job_reqs_normalized)
+            
+            # Semantic match contribution
+            semantic_contribution = sum([m['similarity'] for m in semantic_matches]) / len(job_reqs_normalized) if semantic_matches else 0
+            
+            # Overall score: heavily weighted towards covering requirements
+            overall_score = (
+                0.6 * exact_match_score +  # 60% weight on exact matches
+                0.4 * semantic_contribution  # 40% weight on semantic matches
+            )
+            
+            return {
+                'overall_score': float(min(overall_score, 1.0)),
+                'coverage_score': float(coverage_score),
+                'coverage_percentage': float(coverage_percentage),
+                'exact_match_score': float(exact_match_score),
+                'semantic_score': float(semantic_contribution),
+                'exact_matches': len(exact_matches),
+                'semantic_matches': len(semantic_matches),
+                'total_requirements': len(job_reqs_normalized),
+                'total_matched': total_matched,
+                'exact_match_details': exact_matches[:10],  # Top 10 for display
+                'semantic_match_details': semantic_matches[:10]  # Top 10 for display
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating filtered semantic skill similarity: {e}")
+            return {'overall_score': 0.0, 'coverage_percentage': 0.0}
+
+
+    def calculate_experience_similarity(self, job: Dict, profile: Dict) -> Optional[float]:
+        """
+        Calculate experience similarity using cosine similarity with proper None handling
+        Returns None if there's insufficient experience data
+        """
         try:
             job_experience = self._extract_experience_from_job(job)
             applicant_experience = self._extract_experience_from_profile(profile)
             
-            # If job doesn't require experience, return 0.5 (neutral score)
-            if not job_experience or not job_experience.get('level') or job_experience.get('level', '').lower() in ['', 'none', 'not required', 'any']:
-                return 0.5
+            # Check if BOTH job and applicant have meaningful experience data
+            job_has_experience = (
+                job_experience and 
+                (job_experience.get('level') and job_experience.get('level', '').lower() not in ['', 'none', 'not required', 'any']) or
+                (job_experience.get('years', 0) > 0) or
+                (job_experience.get('description', '').strip() and len(job_experience.get('description', '').strip()) > 20)
+            )
             
-            # If applicant has no experience information, return lower score
-            if not applicant_experience or not applicant_experience.get('description'):
-                return 0.3
+            applicant_has_experience = (
+                applicant_experience and 
+                (applicant_experience.get('level') and applicant_experience.get('level', '').lower() not in ['', 'none']) or
+                (applicant_experience.get('years', 0) > 0) or
+                (applicant_experience.get('description', '').strip() and len(applicant_experience.get('description', '').strip()) > 20)
+            )
+            
+            # If EITHER has no experience data, return None (blank)
+            if not job_has_experience or not applicant_has_experience:
+                logger.debug("Insufficient experience data - returning None")
+                return None
                 
+            # Both have experience data - calculate similarity
             experience_score = self._compare_experience_levels(job_experience, applicant_experience)
             
             # Safely calculate cosine similarity with proper None handling
@@ -1275,7 +1417,7 @@ class JobApplicantMatcher:
             
         except Exception as e:
             logger.error(f"Error calculating experience similarity: {e}")
-            return 0.3
+            return None  # Return None on error instead of 0.3
     def _job_requires_experience(self, job_experience: Dict) -> bool:
         """Determine if the job actually requires experience"""
         try:
@@ -1346,21 +1488,16 @@ class JobApplicantMatcher:
         """Extract experience information from applicant profile with proper None handling"""
         try:
             description = profile.get('description', '') or ''
-            position = profile.get('position', '') or ''
-            company = profile.get('company', '') or ''
-            industry = profile.get('industry', '') or ''
             
             experience_info = {
                 'level': profile.get('experience_level', '') or '',
                 'years': profile.get('years_of_experience', 0) or 0,
-                'description': f"{description} {position} {company} {industry}".strip(),
-                'companies': company,
-                'industry': industry
+                'description': f"{description}".strip(),
             }
             return experience_info
         except Exception as e:
             logger.error(f"Error extracting experience from profile: {e}")
-            return {'level': '', 'years': 0, 'description': '', 'companies': '', 'industry': ''}
+            return {'level': '', 'years': 0, 'description': '', 'companies': ''}
 
     def _compare_experience_levels(self, job_exp: Dict, applicant_exp: Dict) -> float:
         """Compare experience levels and years with enhanced logic"""
@@ -1544,8 +1681,11 @@ class JobApplicantMatcher:
         except Exception as e:
             logger.error(f"Critical error saving matches: {e}")
             
-    def perform_comprehensive_cosine_matching_applicant_to_jobs(self, user_id: str, threshold: float = 0.5, save_to_db: bool = True) -> Dict[str, Any]:
-        """Perform comprehensive cosine similarity matching - one applicant to all jobs"""
+    def perform_comprehensive_cosine_matching_applicant_to_jobs(
+    self, user_id: str, threshold: float = 0.5, save_to_db: bool = True) -> Dict[str, Any]:
+        """
+        Enhanced matching - FULLY PROCESS ONE JOB AT A TIME
+        """
         start_time = time.time()
         
         try:
@@ -1553,16 +1693,14 @@ class JobApplicantMatcher:
             profile = self.get_applicant_profile(user_id)
             
             if not jobs:
-                logger.warning("No jobs found for cosine similarity matching")
                 return {
                     'matches': [],
                     'insufficient_data': False,
-                    'message': 'No active job postings available for matching',
+                    'message': 'No active job postings available',
                     'total_matches': 0
                 }
 
             if not profile:
-                logger.warning(f"No profile found for user {user_id}")
                 return {
                     'matches': [],
                     'insufficient_data': True,
@@ -1573,7 +1711,6 @@ class JobApplicantMatcher:
             has_sufficient_data, data_message = self.has_sufficient_profile_data(profile)
             
             if not has_sufficient_data:
-                logger.warning(f"Applicant {user_id} has insufficient data: {data_message}")
                 return {
                     'matches': [],
                     'insufficient_data': True,
@@ -1581,87 +1718,271 @@ class JobApplicantMatcher:
                     'total_matches': 0
                 }
             
-            logger.info(f"Starting cosine similarity matching for user {user_id} with {len(jobs)} jobs")
+            logger.info(f"Starting ENHANCED matching for user {user_id} with {len(jobs)} jobs")
             
-            cosine_scores = self.calculate_comprehensive_cosine_similarity_applicant_to_jobs(jobs, profile)
+            # Generate profile embedding ONCE (reused for all jobs)
+            logger.info(f"Generating profile embedding...")
+            profile_text = self.create_semantic_text_representation(profile, "applicant")
+            profile_embedding = self.semantic_engine.get_semantic_embedding(profile_text)
             
-            if len(cosine_scores) == 0:
-                logger.warning("No cosine similarity scores calculated")
+            if profile_embedding.size == 0:
+                logger.error("Failed to generate profile embedding")
                 return {
                     'matches': [],
                     'insufficient_data': False,
-                    'message': 'No cosine similarity matches could be calculated',
+                    'message': 'Failed to generate profile embedding',
                     'total_matches': 0
                 }
             
+            logger.info(f"Profile embedding generated. Processing {len(jobs)} jobs one at a time...")
+            
             matches = []
+            
+            # PROCESS EACH JOB COMPLETELY BEFORE MOVING TO NEXT
             for job_idx, job in enumerate(jobs):
-                if job_idx >= len(cosine_scores):
-                    logger.warning(f"Job index {job_idx} out of range for cosine scores")
-                    continue
-                    
-                cosine_score = cosine_scores[job_idx]
+                job_num = job_idx + 1
+                job_title = job.get('title', 'Unknown Title')
+                job_id = job.get('id', 'unknown')
                 
-                if cosine_score < threshold * 0.5:
-                    continue
+                try:
+                    logger.info(f"[{job_num}/{len(jobs)}] Processing: '{job_title}'")
                     
-                skill_score = self.calculate_semantic_skill_similarity(
-                    job.get('requirements', []),
-                    profile.get('skills', [])
-                )
-
-                experience_score = self.calculate_experience_similarity(job, profile)
-
-                scores = self.calculate_cosine_weighted_score(cosine_score, skill_score, experience_score)
-                                
-                if scores['similarity_score'] >= threshold:
-                    match_strength = self.get_cosine_match_strength(scores['similarity_score'])
+                    # Step 1: Generate job embedding
+                    job_text = self.create_semantic_text_representation(job, "job")
+                    job_embedding = self.semantic_engine.get_semantic_embedding(job_text)
                     
+                    if job_embedding.size == 0:
+                        logger.warning(f"[{job_num}/{len(jobs)}] Failed to generate embedding - Skipping")
+                        continue
+                    
+                    # Step 2: Calculate cosine similarity
+                    cosine_score = self.semantic_engine.calculate_cosine_similarity(
+                        job_embedding, profile_embedding
+                    )
+                    
+                    logger.info(f"[{job_num}/{len(jobs)}] Cosine score: {cosine_score:.4f}")
+                    
+                    # Check threshold early
+                    if cosine_score < threshold:
+                        logger.info(f"[{job_num}/{len(jobs)}] Below threshold ({threshold}) - Skipping")
+                        continue
+                    
+                    # Step 3: Calculate skill score
+                    skill_score = self.calculate_semantic_skill_similarity(
+                        job.get('requirements', []),
+                        profile.get('skills', [])
+                    )
+                    logger.info(f"[{job_num}/{len(jobs)}] Skill score: {skill_score:.4f}")
+                    
+                    # Step 4: Calculate experience score
+                    experience_score = self.calculate_experience_similarity(job, profile)
+                    if experience_score is not None:
+                        logger.info(f"[{job_num}/{len(jobs)}] Experience score: {experience_score:.4f}")
+                    else:
+                        logger.info(f"[{job_num}/{len(jobs)}] Experience score: N/A")
+                    
+                    # Step 5: Calculate description score
+                    description_score = self.calculate_description_similarity(job, profile)
+                    logger.info(f"[{job_num}/{len(jobs)}] Description score: {description_score:.4f}")
+                    
+                    # Step 6: Calculate weighted score
+                    scores = self.calculate_enhanced_weighted_score(
+                        cosine_score, skill_score, experience_score, description_score,
+                        job=job, profile=profile
+                    )
+                    
+                    final_score = scores['similarity_score']
+                    logger.info(f"[{job_num}/{len(jobs)}] Final weighted score: {final_score:.4f}")
+                    
+                    # Check final threshold
+                    if final_score < threshold:
+                        logger.info(f"[{job_num}/{len(jobs)}] Final score below threshold - Skipping")
+                        continue
+                    
+                    # Step 7: Determine match strength
+                    match_strength = self.get_cosine_match_strength(final_score)
+                    logger.info(f"[{job_num}/{len(jobs)}] Match strength: {match_strength}")
+                    
+                    # Step 8: Build match data
                     match_data = {
-                        'job_id': job['id'],
+                        'job_id': job_id,
                         'applicant_id': user_id,
                         'scores': scores,
-                        'job_title': job.get('title', 'Unknown Title'),
+                        'job_title': job_title,
                         'job_company': job.get('company_name', 'Unknown Company'),
                         'match_strength': match_strength,
                         'analysis': {
-                            'cosine_interpretation': self.interpret_cosine_match(scores),
-                            'key_strengths': self.identify_key_strengths(scores, job, profile),
-                            'improvement_areas': self.identify_improvement_areas(scores, job, profile)
+                            'cosine_interpretation': self.interpret_enhanced_match(scores),
+                            'key_strengths': self.identify_key_strengths_enhanced(scores, job, profile),
+                            'improvement_areas': self.identify_improvement_areas(scores, job, profile),
+                            'description_analysis': self._get_description_analysis(scores['description_score'])
                         }
                     }
-                    matches.append(match_data)
                     
-                    # Save each match immediately to Supabase
+                    # Step 9: Save to database immediately
                     if save_to_db:
                         try:
-                            self.save_single_match_to_db(match_data, user_id=user_id)
-                            logger.info(f"Immediately saved match for job {job['id']} to applicant {user_id} with score {scores['similarity_score']:.4f}")
+                            logger.info(f"[{job_num}/{len(jobs)}] Saving match to database...")
+                            self.save_enhanced_match_to_db(match_data, user_id=user_id)
+                            logger.info(f"[{job_num}/{len(jobs)}] ✓ Match saved successfully")
                         except Exception as save_error:
-                            logger.error(f"Failed to save immediate match for job {job['id']}: {save_error}")
+                            logger.error(f"[{job_num}/{len(jobs)}] ✗ Failed to save match: {save_error}")
+                    
+                    matches.append(match_data)
+                    logger.info(f"[{job_num}/{len(jobs)}] ✓ COMPLETED: '{job_title}' - Final Score: {final_score:.4f}\n")
+                    
+                except Exception as job_error:
+                    logger.error(f"[{job_num}/{len(jobs)}] ✗ ERROR processing '{job_title}': {job_error}\n")
+                    continue
             
-            # Sort matches by similarity score
+            # Sort and calibrate all matches
+            logger.info(f"All jobs processed. Sorting and calibrating {len(matches)} matches...")
             sorted_matches = sorted(matches, key=lambda x: x['scores']['similarity_score'], reverse=True)
-            
+            calibrated_matches = self.calibrate_match_scores(sorted_matches)
+
             processing_time = time.time() - start_time
-            logger.info(f"Comprehensive cosine similarity matching completed in {processing_time:.2f}s. Found {len(sorted_matches)} matches.")
+            logger.info(f"✓ Matching completed in {processing_time:.2f}s. Found {len(calibrated_matches)} matches.")
             
             return {
-                'matches': sorted_matches,
+                'matches': calibrated_matches,
                 'insufficient_data': False,
-                'message': f'Found {len(sorted_matches)} matches',
-                'total_matches': len(sorted_matches),
-                'processing_time': processing_time
+                'message': f'Found {len(calibrated_matches)} matches with enhanced description scoring',
+                'total_matches': len(calibrated_matches),
+                'processing_time': processing_time,
+                'scoring_method': 'enhanced_with_description_and_calibration'
             }
-            
+                    
         except Exception as e:
-            logger.error(f"Error in comprehensive cosine similarity matching: {e}")
+            logger.error(f"Error in enhanced matching: {e}")
             return {
                 'matches': [],
                 'insufficient_data': False,
                 'message': f'Error during matching: {str(e)}',
                 'total_matches': 0
             }
+    def _get_description_analysis(self, description_score: float) -> str:
+        """Provide interpretation of description matching"""
+        if description_score >= 0.8:
+            return "Excellent alignment between applicant's background and job description"
+        elif description_score >= 0.6:
+            return "Good match between applicant's experience and job requirements"
+        elif description_score >= 0.4:
+            return "Moderate alignment with job description"
+        else:
+            return "Limited description alignment - consider highlighting relevant experience"
+
+    def interpret_enhanced_match(self, scores: Dict[str, float]) -> str:
+        """Enhanced interpretation including description score"""
+        similarity = scores['similarity_score']
+        cosine = scores['cosine_score']
+        skill = scores['skill_score']
+        description = scores.get('description_score', 0)
+        experience = scores.get('experience_score', 0)
+        
+        interpretations = []
+        
+        if cosine > 0.7:
+            interpretations.append("strong overall semantic alignment")
+        elif cosine > 0.5:
+            interpretations.append("moderate overall alignment")
+        
+        if description > 0.7:
+            interpretations.append("excellent description match")
+        elif description > 0.5:
+            interpretations.append("good description alignment")
+            
+        if skill > 0.7:
+            interpretations.append("excellent skill match")
+        elif skill > 0.5:
+            interpretations.append("good skill overlap")
+            
+        if experience > 0.7:
+            interpretations.append("strong experience match")
+            
+        return f"Match shows {', '.join(interpretations)}." if interpretations else "Basic match found."
+
+    def identify_key_strengths_enhanced(self, scores: Dict[str, float], job: Dict, profile: Dict) -> List[str]:
+        """Enhanced strength identification including description"""
+        strengths = []
+        
+        if scores.get('description_score', 0) > 0.7:
+            strengths.append("Strong alignment between background and job description")
+        if scores['cosine_score'] > 0.7:
+            strengths.append("Excellent overall semantic fit")
+        if scores['skill_score'] > 0.7:
+            strengths.append("High degree of skill compatibility")
+        if scores.get('experience_score', 0) > 0.7:
+            strengths.append("Excellent experience match")
+            
+        return strengths if strengths else ["Reasonable overall match"]
+    
+    def identify_key_strengths_enhanced(self, scores: Dict[str, float], job: Dict, profile: Dict) -> List[str]:
+        """Enhanced strength identification including description"""
+        strengths = []
+        
+        if scores.get('description_score', 0) > 0.7:
+            strengths.append("Strong alignment between background and job description")
+        if scores['cosine_score'] > 0.7:
+            strengths.append("Excellent overall semantic fit")
+        if scores['skill_score'] > 0.7:
+            strengths.append("High degree of skill compatibility")
+        if scores.get('experience_score', 0) > 0.7:
+            strengths.append("Excellent experience match")
+            
+        return strengths if strengths else ["Reasonable overall match"]
+
+
+    def save_enhanced_match_to_db(self, match: Dict, user_id: str = None, job_id: str = None):
+        """Save match with description score to database"""
+        try:
+            existing_matches = self.get_existing_matches(user_id, job_id)
+            current_time = datetime.now().isoformat()
+            
+            table_name = 'job_match_notification' if user_id else 'applicant_match'
+            
+            match_key = f"{match.get('applicant_id', user_id)}_{match.get('job_id', job_id)}"
+            existing_match = existing_matches.get(match_key)
+            
+            score_changed = True
+            if existing_match:
+                current_score = match['scores']['similarity_score']
+                previous_score = existing_match['similarity_score']
+                score_changed = abs(current_score - previous_score) > 0.01
+            
+            if not existing_match or score_changed:
+                # Get experience score and convert None to NULL for database
+                experience_score = match['scores'].get('experience_score')
+                
+                match_entry = {
+                    'applicant_id': match.get('applicant_id', user_id),
+                    'job_id': match.get('job_id', job_id),
+                    'similarity_score': float(match['scores']['similarity_score']),
+                    'cosine_score': float(match['scores']['cosine_score']),
+                    'skill_score': float(match['scores']['skill_score']),
+                    'description_score': float(match['scores'].get('description_score', 0.0)),
+                    'match_strength': match['match_strength'],
+                    'updated_at': current_time
+                }
+                
+                # Only add experience_score if it's not None
+                if experience_score is not None:
+                    match_entry['experience_score'] = float(experience_score)
+                # If None, don't include the key (will be NULL in database)
+                
+                if not existing_match:
+                    match_entry['created_at'] = current_time
+                
+                result = self.supabase.table(table_name).upsert(match_entry).execute()
+                
+                if not (hasattr(result, 'error') and result.error):
+                    logger.debug(f"Successfully saved enhanced match to {table_name}")
+                else:
+                    logger.error(f"Error saving enhanced match: {result.error}")
+                    
+        except Exception as e:
+            logger.error(f"Error saving enhanced match: {e}")
+
+
     def perform_comprehensive_cosine_matching_job_to_applicants(self, job_id: str, threshold: float = 0.5, save_to_db: bool = True) -> Dict[str, Any]:
         """Perform comprehensive cosine similarity matching for one job to all applicants"""
         start_time = time.time()
@@ -1732,7 +2053,7 @@ class JobApplicantMatcher:
                     
                 cosine_score = cosine_scores[applicant_idx]
                 
-                if cosine_score < threshold * 0.5:
+                if cosine_score < threshold:
                     continue
                     
                 skill_score = self.calculate_semantic_skill_similarity(
@@ -1817,7 +2138,7 @@ class JobApplicantMatcher:
                 similarity_score = max(0.0, min(1.0, match['scores']['similarity_score']))
                 cosine_score = max(0.0, min(1.0, match['scores']['cosine_score']))
                 skill_score = max(0.0, min(1.0, match['scores']['skill_score']))
-                experience_score = max(0.0, min(1.0, match['scores'].get('experience_score', 0.0)))
+                experience_score_raw = match['scores'].get('experience_score')
                 
                 match_entry = {
                     'applicant_id': match.get('applicant_id', user_id),
@@ -1825,10 +2146,14 @@ class JobApplicantMatcher:
                     'similarity_score': float(similarity_score),
                     'cosine_score': float(cosine_score),
                     'skill_score': float(skill_score),
-                    'experience_score': float(experience_score),
                     'match_strength': match['match_strength'],
                     'updated_at': current_time
                 }
+                
+                # Only add experience_score if it's not None
+                if experience_score_raw is not None:
+                    match_entry['experience_score'] = float(max(0.0, min(1.0, experience_score_raw)))
+                # If None, don't include the key (will be NULL in database)
                 
                 if not existing_match:
                     match_entry['created_at'] = current_time
@@ -1839,15 +2164,6 @@ class JobApplicantMatcher:
                     
                     if hasattr(result, 'error') and result.error:
                         logger.error(f"Database error saving single match to {table_name}: {result.error}")
-                        # Try individual fallback
-                        try:
-                            individual_result = self.supabase.table(table_name).upsert(match_entry).execute()
-                            if not (hasattr(individual_result, 'error') and individual_result.error):
-                                logger.info(f"Individual fallback saved match to {table_name}")
-                            else:
-                                logger.error(f"Individual fallback also failed for {table_name}")
-                        except Exception as individual_error:
-                            logger.error(f"Individual fallback failed: {individual_error}")
                     else:
                         logger.debug(f"Successfully saved single match to {table_name}")
                         
@@ -1946,6 +2262,43 @@ class JobApplicantMatcher:
     def get_top_cosine_matches(self, matches: List[Dict], top_n: int = 10) -> List[Dict]:
         """Get top N cosine similarity matches by primary score"""
         return matches[:top_n]
+    
+    def calibrate_match_scores(self, matches: List[Dict]) -> List[Dict]:
+        """
+        Calibrate scores to better use the 0-1 range
+        """
+        if not matches or len(matches) < 3:
+            return matches
+        
+        try:
+            scores = np.array([m['scores']['similarity_score'] for m in matches])
+            
+            # Temperature scaling for better distribution
+            temperature = 1.5
+            calibrated_scores = 1 / (1 + np.exp(-temperature * (scores - 0.5)))
+            
+            # Quantile normalization
+            if len(calibrated_scores) > 1:
+                ranks = np.argsort(np.argsort(calibrated_scores))
+                normalized_scores = ranks / (len(ranks) - 1)
+            else:
+                normalized_scores = calibrated_scores
+            
+            # Update matches
+            for i, match in enumerate(matches):
+                original_score = match['scores']['similarity_score']
+                match['scores']['similarity_score_uncalibrated'] = original_score
+                match['scores']['similarity_score'] = float(normalized_scores[i])
+                
+                # Re-evaluate match strength with calibrated score
+                match['match_strength'] = self.get_cosine_match_strength(normalized_scores[i])
+            
+            logger.info(f"Calibrated {len(matches)} match scores")
+            return matches
+            
+        except Exception as e:
+            logger.error(f"Error calibrating scores: {e}")
+            return matches
 
     def process_single_applicant_matching(self, applicant_id: str, threshold: float = 0.5) -> Dict[str, Any]:
         """Process cosine similarity matching for a single applicant"""
@@ -2172,7 +2525,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 try:
-    matcher = JobApplicantMatcher(SUPABASE_URL, SUPABASE_KEY, 'thenlper/gte-large')
+    matcher = JobApplicantMatcher(SUPABASE_URL, SUPABASE_KEY, 'BAAI/bge-large-en-v1.5')
     logger.info("Cosine similarity matcher initialized successfully")
 except Exception as e:
     logger.error(f"Failed to initialize cosine similarity matcher: {e}")
@@ -2249,7 +2602,6 @@ def cosine_matching():
         
         # Combined parameter: use_skill_filtering controls which method to use
         use_skill_filtering = data.get('use_skill_filtering', False)  # Default to standard matching
-        use_optimized = data.get('use_optimized', True)  # New parameter for optimized matching
         
         start_time = time.time()
         
@@ -2260,13 +2612,6 @@ def cosine_matching():
             )
             matching_engine = 'filtered_cosine_similarity'
             matching_method = matching_result.get('matching_method', 'filtered_skills_only')
-        elif use_optimized:
-            logger.info(f"Using OPTIMIZED matching for user {user_id}")
-            matching_result = matcher.perform_optimized_cosine_matching_applicant_to_jobs(
-                user_id, threshold, save_to_db
-            )
-            matching_engine = 'optimized_cosine_similarity'
-            matching_method = 'sequential_processing'
         else:
             logger.info(f"Using STANDARD matching for user {user_id}")
             matching_result = matcher.perform_comprehensive_cosine_matching_applicant_to_jobs(
@@ -2277,7 +2622,17 @@ def cosine_matching():
         
         top_matches = matcher.get_top_cosine_matches(matching_result['matches'], top_n)
         response_time = time.time() - start_time
-        
+        use_enhanced_description = data.get('use_enhanced_description', True)  # Default to True
+       
+        if use_enhanced_description:
+            matching_result = matcher.perform_comprehensive_cosine_matching_applicant_to_jobs(
+                user_id, threshold, save_to_db
+            )
+        else:
+            # Use original method
+            matching_result = matcher.perform_comprehensive_cosine_matching_applicant_to_jobs(
+                user_id, threshold, save_to_db
+            )
         serializable_response = convert_to_serializable({
             'success': True,
             'data': {
@@ -2289,7 +2644,6 @@ def cosine_matching():
                 'matching_engine': matching_engine,
                 'matching_method': matching_method,
                 'skill_filtering_enabled': use_skill_filtering,
-                'optimized_processing': use_optimized,
                 'matching_direction': 'one_applicant_to_all_jobs',
                 'table_used': 'job_match_notification',
                 'insufficient_data': matching_result['insufficient_data'],
@@ -2301,6 +2655,7 @@ def cosine_matching():
     except Exception as e:
         logger.error(f"Error in cosine similarity matching: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/batch-cosine-matching/applicants', methods=['POST'])
 def batch_cosine_matching_applicants():
     """Perform cosine similarity matching for all applicant profiles"""
