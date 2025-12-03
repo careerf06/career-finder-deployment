@@ -313,7 +313,8 @@ class JobApplicantMatcher:
             logger.info(f"Initialized JobApplicantMatcher with cosine similarity engine: {model_name}")
             
             self.test_connection()
-            
+            self.active_matching_locks = {}  # Add this
+            self.lock_manager = threading.Lock()
         except Exception as e:
             logger.error(f"Failed to initialize JobApplicantMatcher: {e}")
             raise
@@ -1671,16 +1672,35 @@ class JobApplicantMatcher:
             logger.error(f"Critical error saving matches: {e}")
             
     def perform_comprehensive_cosine_matching_applicant_to_jobs(
-    self, user_id: str, threshold: float = 0.5, save_to_db: bool = True) -> Dict[str, Any]:
-        """
-        OPTIMIZED: Batch embeddings + Individual saves
-        """
-        start_time = time.time()
-        
+    self, user_id: str, threshold: float = 0.5, save_to_db: bool = True
+) -> Dict[str, Any]:
+
+    # ============================================================
+    # 🔒 LOCK CHECK — prevents duplicate simultaneous match runs
+    # ============================================================
+        with self.lock_manager:
+            if user_id in self.active_matching_locks:
+                return {
+                    'matches': [],
+                    'insufficient_data': False,
+                    'message': f'Matching already in progress for user {user_id}',
+                    'total_matches': 0,
+                    'status': 'duplicate_request_blocked'
+                }
+            # Register lock for this user
+            self.active_matching_locks[user_id] = time.time()
+
+        # Make sure lock is always removed no matter what
         try:
+            start_time = time.time()
+
+            # ============================================================
+            # (ALL your original matching logic stays the same below)
+            # ============================================================
+
             jobs = self.get_job_postings()
             profile = self.get_applicant_profile(user_id)
-            
+
             if not jobs:
                 return {
                     'matches': [],
@@ -1698,7 +1718,6 @@ class JobApplicantMatcher:
                 }
 
             has_sufficient_data, data_message = self.has_sufficient_profile_data(profile)
-            
             if not has_sufficient_data:
                 return {
                     'matches': [],
@@ -1706,18 +1725,18 @@ class JobApplicantMatcher:
                     'message': data_message,
                     'total_matches': 0
                 }
-            
-            logger.info(f"Starting OPTIMIZED matching for user {user_id} with {len(jobs)} jobs")
-            
-            # ========================================
-            # STEP 1: Generate profile embedding ONCE
-            # ========================================
+
+            logger.info(f"Starting ONE-BY-ONE matching for user {user_id} with {len(jobs)} jobs")
+
+            # --------------------------
+            # STEP 1: Profile embedding
+            # --------------------------
             logger.info(f"Generating profile embedding...")
             profile_start = time.time()
             profile_text = self.create_semantic_text_representation(profile, "applicant")
             profile_embedding = self.semantic_engine.get_semantic_embedding(profile_text)
             logger.info(f"Profile embedding generated in {time.time() - profile_start:.2f}s")
-            
+
             if profile_embedding.size == 0:
                 logger.error("Failed to generate profile embedding")
                 return {
@@ -1726,122 +1745,64 @@ class JobApplicantMatcher:
                     'message': 'Failed to generate profile embedding',
                     'total_matches': 0
                 }
-            
-            # ========================================
-            # STEP 2: Generate ALL job embeddings in ONE batch (KEY OPTIMIZATION!)
-            # ========================================
-            logger.info(f"Generating embeddings for ALL {len(jobs)} jobs in batch...")
-            batch_start = time.time()
-            
-            # Create all job text representations
-            job_texts = []
-            for job in jobs:
-                job_text = self.create_semantic_text_representation(job, "job")
-                job_texts.append(job_text)
-            
-            # Generate ALL embeddings in ONE batch call - THIS IS THE SPEED FIX!
-            try:
-                with torch.no_grad():
-                    job_embeddings_array = self.semantic_engine.model.encode(
-                        job_texts,
-                        convert_to_tensor=False,
-                        normalize_embeddings=True,
-                        show_progress_bar=False,
-                        batch_size=32  # Process 32 at a time internally
-                    )
-                
-                batch_time = time.time() - batch_start
-                logger.info(f"✓ ALL {len(jobs)} job embeddings generated in {batch_time:.2f}s ({len(jobs)/batch_time:.1f} jobs/sec)")
-                
-            except Exception as e:
-                logger.error(f"Error generating job embeddings: {e}")
-                return {
-                    'matches': [],
-                    'insufficient_data': False,
-                    'message': f'Error generating embeddings: {str(e)}',
-                    'total_matches': 0
-                }
-            
-            # ========================================
-            # STEP 3: Calculate ALL similarities using vectorization
-            # ========================================
-            logger.info(f"Calculating similarities for {len(jobs)} jobs...")
-            similarity_start = time.time()
-            
-            # Normalize profile embedding
-            profile_norm = np.linalg.norm(profile_embedding)
-            if profile_norm > 0:
-                profile_normalized = profile_embedding / profile_norm
-            else:
-                profile_normalized = profile_embedding
-            
-            # Normalize all job embeddings
-            job_norms = np.linalg.norm(job_embeddings_array, axis=1, keepdims=True)
-            job_norms[job_norms == 0] = 1
-            job_embeddings_normalized = job_embeddings_array / job_norms
-            
-            # Calculate ALL cosine similarities at once (vectorized - super fast!)
-            cosine_scores_array = np.dot(job_embeddings_normalized, profile_normalized)
-            
-            logger.info(f"✓ All {len(jobs)} similarities calculated in {time.time() - similarity_start:.2f}s")
-            
-            # ========================================
-            # STEP 4: Process matches and save individually
-            # ========================================
-            logger.info(f"Processing and saving matches (threshold: {threshold})...")
+
             matches = []
             current_time = datetime.now().isoformat()
-            
+
+            # --------------------------
+            # STEP 2: Process each job
+            # --------------------------
+            logger.info(f"Processing {len(jobs)} jobs one at a time...")
+
             for job_idx, job in enumerate(jobs):
                 job_num = job_idx + 1
                 job_id = job['id']
                 job_title = job.get('title', 'Unknown Title')
-                
-                # Get pre-calculated cosine score
-                cosine_score = float(cosine_scores_array[job_idx])
-                
-                # Early exit if below threshold
-                if cosine_score < threshold:
-                    continue
-                
-                logger.info(f"[{job_num}/{len(jobs)}] Processing: '{job_title}' (cosine: {cosine_score:.4f})")
-                
+
+                logger.info(f"[{job_num}/{len(jobs)}] ===== Starting job: '{job_title}' =====")
+
                 try:
-                    # Calculate additional scores
+                    # 1. Job embedding
+                    job_embedding_start = time.time()
+                    job_text = self.create_semantic_text_representation(job, "job")
+                    job_embedding = self.semantic_engine.get_semantic_embedding(job_text)
+                    logger.info(f"[{job_num}/{len(jobs)}] Job embedding generated in "
+                                f"{time.time() - job_embedding_start:.2f}s")
+
+                    if job_embedding.size == 0:
+                        logger.warning(f"[{job_num}/{len(jobs)}] No embedding — Skipping")
+                        continue
+
+                    # 2. Cosine similarity
+                    cosine_score = self.semantic_engine.calculate_cosine_similarity(
+                        job_embedding, profile_embedding
+                    )
+                    logger.info(f"[{job_num}/{len(jobs)}] Cosine score: {cosine_score:.4f}")
+
+                    if cosine_score < threshold:
+                        logger.info(f"[{job_num}/{len(jobs)}] Below threshold — Skipping")
+                        continue
+
+                    # 3–6: Additional semantic scores
                     skill_score = self.calculate_semantic_skill_similarity(
                         job.get('requirements', []),
                         profile.get('skills', [])
                     )
-                    logger.debug(f"[{job_num}/{len(jobs)}] Skill score: {skill_score:.4f}")
-                    
                     experience_score = self.calculate_experience_similarity(job, profile)
-                    if experience_score is not None:
-                        logger.debug(f"[{job_num}/{len(jobs)}] Experience score: {experience_score:.4f}")
-                    else:
-                        logger.debug(f"[{job_num}/{len(jobs)}] Experience score: N/A")
-                    
                     description_score = self.calculate_description_similarity(job, profile)
-                    logger.debug(f"[{job_num}/{len(jobs)}] Description score: {description_score:.4f}")
-                    
-                    # Calculate weighted score
+
+                    # 7. Weighted final score
                     scores = self.calculate_enhanced_weighted_score(
                         cosine_score, skill_score, experience_score, description_score,
                         job=job, profile=profile
                     )
-                    
                     final_score = scores['similarity_score']
-                    logger.info(f"[{job_num}/{len(jobs)}] Final weighted score: {final_score:.4f}")
-                    
-                    # Check final threshold
+
                     if final_score < threshold:
-                        logger.info(f"[{job_num}/{len(jobs)}] Final score below threshold - Skipping")
                         continue
-                    
-                    # Determine match strength
+
                     match_strength = self.get_cosine_match_strength(final_score)
-                    logger.info(f"[{job_num}/{len(jobs)}] Match strength: {match_strength}")
-                    
-                    # Build match data
+
                     match_data = {
                         'job_id': job_id,
                         'applicant_id': user_id,
@@ -1856,76 +1817,62 @@ class JobApplicantMatcher:
                             'description_analysis': self._get_description_analysis(scores['description_score'])
                         }
                     }
-                    
+
                     matches.append(match_data)
-                    
-                    # ========================================
-                    # SAVE INDIVIDUALLY (as requested)
-                    # ========================================
+
+                    # 8. Save to DB (one by one)
                     if save_to_db:
-                        try:
-                            logger.info(f"[{job_num}/{len(jobs)}] Saving match to database...")
-                            
-                            experience_score_val = scores.get('experience_score')
-                            match_entry = {
-                                'applicant_id': user_id,
-                                'job_id': job_id,
-                                'similarity_score': float(scores['similarity_score']),
-                                'cosine_score': float(scores['cosine_score']),
-                                'skill_score': float(scores['skill_score']),
-                                'description_score': float(scores.get('description_score', 0.0)),
-                                'match_strength': match_strength,
-                                'updated_at': current_time,
-                                'created_at': current_time
-                            }
-                            
-                            if experience_score_val is not None:
-                                match_entry['experience_score'] = float(experience_score_val)
-                            
-                            # Individual save
-                            result = self.supabase.table('job_match_notification').upsert(match_entry).execute()
-                            
-                            if hasattr(result, 'error') and result.error:
-                                logger.error(f"[{job_num}/{len(jobs)}] ✗ Database error: {result.error}")
-                            else:
-                                logger.info(f"[{job_num}/{len(jobs)}] ✓ Match saved successfully")
-                                
-                        except Exception as save_error:
-                            logger.error(f"[{job_num}/{len(jobs)}] ✗ Failed to save: {save_error}")
-                    
-                    logger.info(f"[{job_num}/{len(jobs)}] ✓ COMPLETED: '{job_title}' - Score: {final_score:.4f}\n")
-                    
+                        match_entry = {
+                            'applicant_id': user_id,
+                            'job_id': job_id,
+                            'similarity_score': float(scores['similarity_score']),
+                            'cosine_score': float(scores['cosine_score']),
+                            'skill_score': float(scores['skill_score']),
+                            'description_score': float(scores.get('description_score', 0.0)),
+                            'match_strength': match_strength,
+                            'updated_at': current_time,
+                            'created_at': current_time
+                        }
+
+                        if scores.get('experience_score') is not None:
+                            match_entry['experience_score'] = float(scores['experience_score'])
+
+                        self.supabase.table('job_match_notification').upsert(match_entry).execute()
+
                 except Exception as job_error:
-                    logger.error(f"[{job_num}/{len(jobs)}] ✗ ERROR: {job_error}\n")
+                    logger.error(f"[{job_num}/{len(jobs)}] ERROR processing job: {job_error}")
                     continue
-            
-            # ========================================
-            # STEP 5: Sort and calibrate matches
-            # ========================================
-            logger.info(f"Sorting and calibrating {len(matches)} matches...")
+
+            # --------------------------
+            # STEP 3: Final sorting
+            # --------------------------
             sorted_matches = sorted(matches, key=lambda x: x['scores']['similarity_score'], reverse=True)
-            calibrated_matches = self.calibrate_match_scores(sorted_matches)
-            
-            processing_time = time.time() - start_time
-            logger.info(f"✓ OPTIMIZED matching completed in {processing_time:.2f}s. Found {len(calibrated_matches)} matches.")
-            
+            calibrated = self.calibrate_match_scores(sorted_matches)
+
             return {
-                'matches': calibrated_matches,
+                'matches': calibrated,
                 'insufficient_data': False,
-                'message': f'Found {len(calibrated_matches)} matches with optimized processing',
-                'total_matches': len(calibrated_matches),
-                'processing_time': processing_time,
-                'scoring_method': 'optimized_batch_embeddings_individual_saves'
+                'message': f'Found {len(calibrated)} matches with one-by-one processing',
+                'total_matches': len(calibrated),
+                'processing_time': time.time() - start_time,
+                'scoring_method': 'one_by_one_individual_embeddings'
             }
-                        
+
         except Exception as e:
-            logger.error(f"Error in optimized matching: {e}")
+            logger.error(f"Error in one-by-one matching: {e}")
             return {
                 'matches': [],
                 'insufficient_data': False,
                 'message': f'Error during matching: {str(e)}',
                 'total_matches': 0
             }
+
+        finally:
+            # ============================================================
+            # 🔓 ALWAYS RELEASE LOCK
+            # ============================================================
+            with self.lock_manager:
+                self.active_matching_locks.pop(user_id, None)
 
     def _get_description_analysis(self, description_score: float) -> str:
         """Provide interpretation of description matching"""
@@ -2809,8 +2756,7 @@ def cosine_matching():
         top_n = int(data.get('top_n', 20))
         save_to_db = data.get('save_to_db', True)
         
-        # Combined parameter: use_skill_filtering controls which method to use
-        use_skill_filtering = data.get('use_skill_filtering', False)  # Default to standard matching
+        use_skill_filtering = data.get('use_skill_filtering', False)  
         
         start_time = time.time()
         
@@ -2829,19 +2775,10 @@ def cosine_matching():
             matching_engine = 'comprehensive_cosine_similarity'
             matching_method = 'standard_all_skills'
         
+
         top_matches = matcher.get_top_cosine_matches(matching_result['matches'], top_n)
         response_time = time.time() - start_time
-        use_enhanced_description = data.get('use_enhanced_description', True)  # Default to True
-       
-        if use_enhanced_description:
-            matching_result = matcher.perform_comprehensive_cosine_matching_applicant_to_jobs(
-                user_id, threshold, save_to_db
-            )
-        else:
-            # Use original method
-            matching_result = matcher.perform_comprehensive_cosine_matching_applicant_to_jobs(
-                user_id, threshold, save_to_db
-            )
+        
         serializable_response = convert_to_serializable({
             'success': True,
             'data': {
@@ -2861,6 +2798,7 @@ def cosine_matching():
         })
         
         return jsonify(serializable_response)
+        
     except Exception as e:
         logger.error(f"Error in cosine similarity matching: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -2877,7 +2815,6 @@ def batch_cosine_matching_applicants():
         max_profiles = data.get('max_profiles')
         use_skill_filtering = data.get('use_skill_filtering', False)
         
-        # Use the optimized batch processing that now includes skill filtering
         if use_skill_filtering:
             result = matcher.batch_process_all_applicants_optimized(threshold, max_profiles)
         else:
