@@ -1883,14 +1883,14 @@ class JobApplicantMatcher:
             
     def perform_comprehensive_cosine_matching_applicant_to_jobs(
     self, user_id: str, threshold: float = 0.5, save_to_db: bool = True
-) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         """
         Perform comprehensive cosine similarity matching for one applicant to all jobs.
         Modified with time-based lock to prevent only rapid duplicate clicks within cooldown period.
         Allows concurrent matching for different users and same user after cooldown.
         """
-     
-        COOLDOWN_SECONDS = 60
+        
+        COOLDOWN_SECONDS = 60  # Adjust this as needed
         
         with self.lock_manager:
             if user_id in self.active_matching_locks:
@@ -1915,9 +1915,30 @@ class JobApplicantMatcher:
         try:
             start_time = time.time()
 
-            # ============================================================
-            # STEP 1: Fetch jobs and profile
-            # ============================================================
+       
+            logger.info("Checking if semantic engine is ready...")
+            if not self.ensure_engine_ready(timeout=90):
+                logger.error("Semantic engine not ready - cannot perform matching")
+                return {
+                    'matches': [],
+                    'insufficient_data': False,
+                    'message': 'Semantic matching engine is still initializing. Please try again in a few moments.',
+                    'total_matches': 0,
+                    'status': 'engine_not_ready'
+                }
+            
+            if self.semantic_engine is None:
+                logger.error("Semantic engine is None even after ensure_engine_ready")
+                return {
+                    'matches': [],
+                    'insufficient_data': False,
+                    'message': 'Semantic matching engine failed to initialize. Please contact support.',
+                    'total_matches': 0,
+                    'status': 'engine_initialization_failed'
+                }
+            
+            logger.info("✓ Semantic engine is ready and loaded")
+
             jobs = self.get_job_postings()
             profile = self.get_applicant_profile(user_id)
 
@@ -1939,9 +1960,7 @@ class JobApplicantMatcher:
                     'total_matches': 0
                 }
 
-            # ============================================================
-            # STEP 2: Validate profile data
-            # ============================================================
+       
             has_sufficient_data, data_message = self.has_sufficient_profile_data(profile)
             
             if not has_sufficient_data:
@@ -1955,12 +1974,19 @@ class JobApplicantMatcher:
 
             logger.info(f"Starting ONE-BY-ONE matching for user {user_id} with {len(jobs)} jobs")
 
-            # ============================================================
-            # STEP 3: Generate profile embedding ONCE
-            # ============================================================
             logger.info(f"Generating profile embedding...")
             profile_start = time.time()
             profile_text = self.create_semantic_text_representation(profile, "applicant")
+            
+            if self.semantic_engine is None:
+                logger.error("Semantic engine became None before profile embedding")
+                return {
+                    'matches': [],
+                    'insufficient_data': False,
+                    'message': 'Semantic engine error during processing',
+                    'total_matches': 0
+                }
+            
             profile_embedding = self.semantic_engine.get_semantic_embedding(profile_text)
             logger.info(f"Profile embedding generated in {time.time() - profile_start:.2f}s")
 
@@ -1976,9 +2002,7 @@ class JobApplicantMatcher:
             matches = []
             current_time = datetime.now().isoformat()
 
-            # ============================================================
-            # STEP 4: Process each job individually
-            # ============================================================
+
             logger.info(f"Processing {len(jobs)} jobs one at a time...")
 
             for job_idx, job in enumerate(jobs):
@@ -1989,7 +2013,10 @@ class JobApplicantMatcher:
                 logger.info(f"[{job_num}/{len(jobs)}] ===== Starting job: '{job_title}' =====")
 
                 try:
-                    # 1. Job embedding
+                    if self.semantic_engine is None:
+                        logger.error(f"[{job_num}/{len(jobs)}] Semantic engine became None - stopping")
+                        break
+                    
                     job_embedding_start = time.time()
                     job_text = self.create_semantic_text_representation(job, "job")
                     job_embedding = self.semantic_engine.get_semantic_embedding(job_text)
@@ -2000,7 +2027,6 @@ class JobApplicantMatcher:
                         logger.warning(f"[{job_num}/{len(jobs)}] No embedding — Skipping")
                         continue
 
-                    # 2. Cosine similarity
                     cosine_score = self.semantic_engine.calculate_cosine_similarity(
                         job_embedding, profile_embedding
                     )
@@ -2010,25 +2036,21 @@ class JobApplicantMatcher:
                         logger.info(f"[{job_num}/{len(jobs)}] Below threshold — Skipping")
                         continue
 
-                    # 3. Skill score
                     skill_score = self.calculate_semantic_skill_similarity(
                         job.get('requirements', []),
                         profile.get('skills', [])
                     )
                     logger.debug(f"[{job_num}/{len(jobs)}] Skill score: {skill_score:.4f}")
 
-                    # 4. Experience score
                     experience_score = self.calculate_experience_similarity(job, profile)
                     if experience_score is not None:
                         logger.debug(f"[{job_num}/{len(jobs)}] Experience score: {experience_score:.4f}")
                     else:
                         logger.debug(f"[{job_num}/{len(jobs)}] Experience score: N/A")
 
-                    # 5. Description score
                     description_score = self.calculate_description_similarity(job, profile)
                     logger.debug(f"[{job_num}/{len(jobs)}] Description score: {description_score:.4f}")
 
-                    # 6. Weighted final score
                     scores = self.calculate_enhanced_weighted_score(
                         cosine_score, skill_score, experience_score, description_score,
                         job=job, profile=profile
@@ -2040,11 +2062,9 @@ class JobApplicantMatcher:
                         logger.info(f"[{job_num}/{len(jobs)}] Final score below threshold — Skipping")
                         continue
 
-                    # 7. Determine match strength
                     match_strength = self.get_cosine_match_strength(final_score)
                     logger.info(f"[{job_num}/{len(jobs)}] Match strength: {match_strength}")
 
-                    # 8. Build match data
                     match_data = {
                         'job_id': job_id,
                         'applicant_id': user_id,
@@ -2062,7 +2082,6 @@ class JobApplicantMatcher:
 
                     matches.append(match_data)
 
-                    # 9. Save to DB individually
                     if save_to_db:
                         try:
                             logger.info(f"[{job_num}/{len(jobs)}] Saving match to database...")
@@ -2079,11 +2098,9 @@ class JobApplicantMatcher:
                                 'created_at': current_time
                             }
 
-                            # Only add experience_score if it's not None
                             if scores.get('experience_score') is not None:
                                 match_entry['experience_score'] = float(scores['experience_score'])
 
-                            # Individual save
                             result = self.supabase.table('job_match_notification').upsert(match_entry).execute()
                             
                             if hasattr(result, 'error') and result.error:
@@ -2100,9 +2117,7 @@ class JobApplicantMatcher:
                     logger.error(f"[{job_num}/{len(jobs)}] ✗ ERROR processing job: {job_error}\n")
                     continue
 
-            # ============================================================
-            # STEP 5: Sort and calibrate matches
-            # ============================================================
+        
             logger.info(f"Sorting and calibrating {len(matches)} matches...")
             sorted_matches = sorted(matches, key=lambda x: x['scores']['similarity_score'], reverse=True)
             calibrated = self.calibrate_match_scores(sorted_matches)
@@ -2121,6 +2136,8 @@ class JobApplicantMatcher:
 
         except Exception as e:
             logger.error(f"Error in one-by-one matching: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return {
                 'matches': [],
                 'insufficient_data': False,
@@ -2129,15 +2146,11 @@ class JobApplicantMatcher:
             }
 
         finally:
-            # ============================================================
-            # 🔓 ALWAYS CLEAN UP OLD LOCKS (keep last 100 entries)
-            # ============================================================
+         
             with self.lock_manager:
-                # Clean up old locks periodically to prevent memory bloat
                 if len(self.active_matching_locks) > 100:
                     logger.info(f"Cleaning up old locks. Current count: {len(self.active_matching_locks)}")
                     
-                    # Sort by timestamp (newest first) and keep only recent 100
                     sorted_locks = sorted(
                         self.active_matching_locks.items(), 
                         key=lambda x: x[1], 
