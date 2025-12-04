@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
+import sys
 import threading
 from flask import Flask, jsonify, request
 from sentence_transformers import SentenceTransformer
@@ -23,6 +24,19 @@ from nltk.tokenize import word_tokenize
 from nltk.stem import WordNetLemmatizer
 import spacy
 from collections import Counter
+import pickle
+import platform
+
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1' 
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Disable tokenizer parallelism
+
+# Set PyTorch to use CPU only
+torch.set_num_threads(1)  # Use single thread for PyTorch
+torch.set_grad_enabled(False)  # Disable gradients for inference
 
 try:
     nltk.data.find('tokenizers/punkt')
@@ -51,6 +65,79 @@ CORS(app)
 
 nltk_setup_done = False
 
+# ==================== PERSISTENT CACHE SYSTEM ====================
+class PersistentCache:
+    """Persistent cache system to prevent model re-downloads and speed up cold starts"""
+    
+    def __init__(self, cache_dir: str = None):
+        self.cache_dir = cache_dir or os.getenv('PERSISTENT_CACHE_DIR', '/tmp/semantic_matching_cache')
+        self.model_cache_dir = os.path.join(self.cache_dir, 'models')
+        self.embedding_cache_dir = os.path.join(self.cache_dir, 'embeddings')
+        
+        # Create cache directories
+        os.makedirs(self.model_cache_dir, exist_ok=True)
+        os.makedirs(self.embedding_cache_dir, exist_ok=True)
+        
+        # Set environment variables for HuggingFace cache
+        os.environ['TRANSFORMERS_CACHE'] = self.model_cache_dir
+        os.environ['HF_HOME'] = self.model_cache_dir
+        os.environ['HF_HUB_CACHE'] = os.path.join(self.model_cache_dir, 'hub')
+        
+        logger.info(f"Persistent cache initialized at: {self.cache_dir}")
+    
+    def get_model_path(self, model_name: str) -> str:
+        """Get model cache path"""
+        safe_name = model_name.replace('/', '_').replace('\\', '_').replace(':', '_')
+        return os.path.join(self.model_cache_dir, safe_name)
+    
+    def save_model_state(self, model_name: str, model_data: Any):
+        """Save model state to disk"""
+        model_path = self.get_model_path(model_name)
+        try:
+            with open(model_path + '.pkl', 'wb') as f:
+                pickle.dump(model_data, f)
+            logger.info(f"Model state saved to: {model_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save model state: {e}")
+            return False
+    
+    def load_model_state(self, model_name: str) -> Optional[Any]:
+        """Load model state from disk"""
+        model_path = self.get_model_path(model_name) + '.pkl'
+        if os.path.exists(model_path):
+            try:
+                with open(model_path, 'rb') as f:
+                    model_data = pickle.load(f)
+                logger.info(f"Model state loaded from: {model_path}")
+                return model_data
+            except Exception as e:
+                logger.error(f"Failed to load model state: {e}")
+        return None
+    
+    def save_embeddings(self, key: str, embeddings: np.ndarray):
+        """Save embeddings to disk"""
+        try:
+            cache_path = os.path.join(self.embedding_cache_dir, hashlib.md5(key.encode()).hexdigest() + '.npz')
+            np.savez_compressed(cache_path, embeddings=embeddings)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save embeddings: {e}")
+            return False
+    
+    def load_embeddings(self, key: str) -> Optional[np.ndarray]:
+        """Load embeddings from disk"""
+        try:
+            cache_path = os.path.join(self.embedding_cache_dir, hashlib.md5(key.encode()).hexdigest() + '.npz')
+            if os.path.exists(cache_path):
+                data = np.load(cache_path)
+                return data['embeddings']
+        except Exception as e:
+            logger.error(f"Failed to load embeddings: {e}")
+        return None
+
+# Initialize persistent cache
+persistent_cache = PersistentCache()
 def convert_to_serializable(obj: Any) -> Any:
     """Convert non-serializable objects to JSON-serializable types"""
     if isinstance(obj, (np.float32, np.float64)):
@@ -70,114 +157,193 @@ def convert_to_serializable(obj: Any) -> Any:
     else:
         return obj
 
-class SemanticSimilarityEngine:
-    """Enhanced semantic similarity engine with manual cosine similarity"""
+class LightweightSemanticEngine:
+    """Lightweight semantic engine optimized for CPU-only Railway deployment"""
     
-    def __init__(self, model_name: str = 'BAAI/bge-large-en-v1.5'):
-        try:
-            cache_dir = os.getenv('TRANSFORMERS_CACHE', '/tmp/transformers_cache')
-            os.makedirs(cache_dir, exist_ok=True)
-            
-            self.model = SentenceTransformer(
-                model_name,
-                device='cpu',
-                use_auth_token=False,
-                cache_folder=cache_dir
-            )
-            if hasattr(self.model, 'eval'):
-                self.model.eval()
-            
-            logger.info(f"SemanticSimilarityEngine initialized with model: {model_name}")
-        except Exception as e:
-            logger.error(f"Failed to initialize SemanticSimilarityEngine: {e}")
-            raise
+    def __init__(self, model_name: str = 'BAAI/bge-small-en-v1.5'):
+        """
+        Use bge-small-en-v1.5 instead of bge-large-en-v1.5
+        - Small: 33M params (vs 335M in large)
+        - 384 dimensions (vs 1024 in large)
+        - Much faster CPU inference
+        - Almost as good for semantic similarity
+        """
+        self.model_name = model_name
+        self.model = None
+        self.model_loaded = False
+        self.model_lock = threading.Lock()
         
+        # Lightweight NLP components
         try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            logger.warning("spaCy English model not found. Using basic tokenization.")
+            self.nlp = spacy.load("en_core_web_sm", disable=['parser', 'ner'])
+        except (OSError, ImportError):
+            logger.info("spaCy not available, using NLTK only")
             self.nlp = None
         
         self.lemmatizer = WordNetLemmatizer()
         self.stop_words = set(stopwords.words('english'))
         
-    def get_semantic_embedding(self, text: str) -> np.ndarray:
-        """Get semantic embedding for text using cosine similarity compatible format"""
-        if not text or not text.strip():
-            return np.zeros(1024, dtype=np.float32) 
+        # Background model loading
+        threading.Thread(target=self._load_model_background, daemon=True).start()
+        
+        logger.info(f"LightweightSemanticEngine initialized (will load {model_name} in background)")
+    
+    def _load_model_background(self):
+        """Load model in background thread with persistence and CPU optimization"""
         try:
+            model_cache_dir = persistent_cache.model_cache_dir
+            
+            logger.info(f"Starting background model loading: {self.model_name}")
+            
+            # Load model with CPU optimization
+            with self.model_lock:
+                start_time = time.time()
+                
+                # Try to load from persistent cache first
+                model_state = persistent_cache.load_model_state(self.model_name)
+                if model_state:
+                    logger.info(f"Loading model from cache: {self.model_name}")
+                    self.model = model_state
+                else:
+                    logger.info(f"Downloading model: {self.model_name}")
+                    
+                    # Use smaller batch size and simplified config for CPU
+                    self.model = SentenceTransformer(
+                        self.model_name,
+                        device='cpu',
+                        use_auth_token=False,
+                        cache_folder=model_cache_dir
+                    )
+                    
+                    # Save to persistent cache
+                    persistent_cache.save_model_state(self.model_name, self.model)
+                
+                # Set to eval mode
+                if hasattr(self.model, 'eval'):
+                    self.model.eval()
+                
+                # Freeze model for CPU optimization
+                for param in self.model.parameters():
+                    param.requires_grad = False
+                
+                self.model_loaded = True
+                load_time = time.time() - start_time
+                logger.info(f"✓ Model loaded in {load_time:.1f}s: {self.model_name}")
+                
+                # Memory cleanup
+                import gc
+                gc.collect()
+                
+        except Exception as e:
+            logger.error(f"Failed to load model in background: {e}")
+            self.model_loaded = False
+    
+    def ensure_model_loaded(self, timeout: int = 45) -> bool:
+        """Ensure model is loaded before use, with timeout"""
+        if self.model_loaded:
+            return True
+            
+        logger.info(f"Waiting for model to load (timeout: {timeout}s)...")
+        start_time = time.time()
+        
+        while not self.model_loaded:
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                logger.error(f"Model loading timeout after {timeout} seconds")
+                return False
+            
+            # Log progress every 5 seconds
+            if int(elapsed) % 5 == 0 and int(elapsed) > 0:
+                logger.info(f"Still loading model... ({int(elapsed)}s elapsed)")
+            
+            time.sleep(0.5)
+        
+        logger.info(f"Model loaded successfully after {time.time() - start_time:.1f}s")
+        return True
+    
+    def get_semantic_embedding(self, text: str) -> np.ndarray:
+        """Get semantic embedding for text with caching and CPU optimization"""
+        if not text or not text.strip():
+            return np.zeros(384, dtype=np.float32)
+            
+        # Try to get from persistent cache first
+        cache_key = f"embedding_{hashlib.md5(text.encode()).hexdigest()}"
+        cached_embedding = persistent_cache.load_embeddings(cache_key)
+        
+        if cached_embedding is not None:
+            logger.debug(f"Cache hit for embedding: {cache_key[:20]}...")
+            return cached_embedding
+        
+        # Ensure model is loaded
+        if not self.ensure_model_loaded():
+            logger.warning("Model not loaded, returning zeros")
+            return np.zeros(384, dtype=np.float32)
+        
+        try:
+            # Use smaller batch size for CPU
             with torch.no_grad():
                 embedding = self.model.encode(
                     text, 
                     convert_to_tensor=False, 
                     normalize_embeddings=True,
-                    show_progress_bar=False
+                    show_progress_bar=False,
+                    batch_size=8  # Smaller batch for CPU
                 )
-            return embedding.astype(np.float32)
+            
+            embedding = embedding.astype(np.float32)
+            
+            # Save to persistent cache
+            persistent_cache.save_embeddings(cache_key, embedding)
+            
+            return embedding
+            
         except Exception as e:
             logger.error(f"Error generating embedding: {e}")
-            return np.zeros(1024, dtype=np.float32)
+            return np.zeros(384, dtype=np.float32)
     
     def manual_cosine_similarity(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
-        """Manual cosine similarity calculation using the formula: (A·B) / (||A|| * ||B||)"""
+        """Manual cosine similarity optimized for CPU"""
         try:
             if embedding1.size == 0 or embedding2.size == 0:
                 return 0.0
             
-            if embedding1.ndim > 1:
-                embedding1 = embedding1.flatten()
-            if embedding2.ndim > 1:
-                embedding2 = embedding2.flatten()
+            # Flatten arrays
+            embedding1 = embedding1.flatten()
+            embedding2 = embedding2.flatten()
             
-            # Ensure both embeddings have the same dimensions
+            # Use min dimensions for speed
             min_dim = min(embedding1.shape[0], embedding2.shape[0])
-            embedding1 = embedding1[:min_dim]
-            embedding2 = embedding2[:min_dim]
             
-            # Step 1: Calculate dot product (A · B)
-            dot_product = np.dot(embedding1, embedding2)
+            # Use numpy operations which are CPU-optimized
+            dot_product = np.dot(embedding1[:min_dim], embedding2[:min_dim])
+            norm1 = np.linalg.norm(embedding1[:min_dim])
+            norm2 = np.linalg.norm(embedding2[:min_dim])
             
-            # Step 2: Calculate magnitudes (||A|| and ||B||)
-            magnitude_a = np.linalg.norm(embedding1)
-            magnitude_b = np.linalg.norm(embedding2)
-            
-            # Step 3: Avoid division by zero
-            if magnitude_a == 0 or magnitude_b == 0:
+            if norm1 == 0 or norm2 == 0:
                 return 0.0
             
-            # Step 4: Calculate cosine similarity: (A·B) / (||A|| * ||B||)
-            cosine_similarity = dot_product / (magnitude_a * magnitude_b)
-            
-            # Ensure the result is between -1 and 1 (due to floating point precision)
-            cosine_similarity = max(-1.0, min(1.0, cosine_similarity))
-            
-            logger.debug(f"Cosine similarity calculation: dot_product={dot_product:.4f}, "
-                        f"magnitude_a={magnitude_a:.4f}, magnitude_b={magnitude_b:.4f}, "
-                        f"result={cosine_similarity:.4f}")
-            
-            return float(cosine_similarity)
+            similarity = dot_product / (norm1 * norm2)
+            return float(max(-1.0, min(1.0, similarity)))
             
         except Exception as e:
-            logger.error(f"Error in manual cosine similarity calculation: {e}")
+            logger.error(f"Error in cosine similarity: {e}")
             return 0.0
     
     def calculate_cosine_similarity(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
-        """Calculate cosine similarity between two embeddings using manual computation"""
+        """Calculate cosine similarity"""
         return self.manual_cosine_similarity(embedding1, embedding2)
     
     def calculate_semantic_similarity(self, text1: str, text2: str) -> float:
-        """Calculate semantic similarity between two texts using cosine similarity on embeddings"""
+        """Calculate semantic similarity between two texts"""
         if not text1.strip() or not text2.strip():
             return 0.0
             
         try:
             embedding1 = self.get_semantic_embedding(text1)
             embedding2 = self.get_semantic_embedding(text2)
-            
-            similarity = self.calculate_cosine_similarity(embedding1, embedding2)
-            return float(similarity)
+            return self.calculate_cosine_similarity(embedding1, embedding2)
         except Exception as e:
-            logger.error(f"Error in semantic similarity calculation: {e}")
+            logger.error(f"Error in semantic similarity: {e}")
             return 0.0
     
     def calculate_keyword_similarity(self, text1: str, text2: str) -> float:
@@ -198,28 +364,13 @@ class SemanticSimilarityEngine:
             if union == 0:
                 return 0.0
                 
-            similarity = intersection / union
-            return float(similarity)
+            return float(intersection / union)
         except Exception as e:
-            logger.error(f"Error in keyword similarity calculation: {e}")
-            return 0.0
-    
-    def calculate_hybrid_similarity(self, text1: str, text2: str, 
-                                  semantic_weight: float = 0.7, 
-                                  keyword_weight: float = 0.3) -> float:
-        """Calculate hybrid similarity combining cosine semantic and keyword approaches"""
-        try:
-            semantic_sim = self.calculate_semantic_similarity(text1, text2)
-            keyword_sim = self.calculate_keyword_similarity(text1, text2)
-            
-            hybrid_score = (semantic_weight * semantic_sim) + (keyword_weight * keyword_sim)
-            return float(hybrid_score)
-        except Exception as e:
-            logger.error(f"Error in hybrid similarity calculation: {e}")
+            logger.error(f"Error in keyword similarity: {e}")
             return 0.0
     
     def _preprocess_text(self, text: str) -> List[str]:
-        """Preprocess text for keyword analysis"""
+        """Fast text preprocessing"""
         if not text:
             return []
         
@@ -228,27 +379,25 @@ class SemanticSimilarityEngine:
             
             if self.nlp:
                 doc = self.nlp(text)
-                tokens = [token.lemma_ for token in doc if not token.is_stop and not token.is_punct and token.is_alpha]
+                return [token.lemma_ for token in doc if not token.is_stop and token.is_alpha]
             else:
                 tokens = word_tokenize(text)
-                tokens = [self.lemmatizer.lemmatize(token) for token in tokens 
-                         if token.lower() not in self.stop_words and token.isalpha()]
-            
-            return tokens
+                return [self.lemmatizer.lemmatize(t) for t in tokens 
+                       if t.lower() not in self.stop_words and t.isalpha()]
         except Exception as e:
-            logger.error(f"Error in text preprocessing: {e}")
+            logger.error(f"Error preprocessing text: {e}")
             return []
-
 class STSConfig:
     """Configuration for Semantic Textual Similarity system"""
     
     def __init__(self):
-        self.model_name = os.getenv('STS_MODEL_NAME', 'BAAI/bge-large-en-v1.5')
+        # Use smaller model for CPU optimization
+        self.model_name = os.getenv('STS_MODEL_NAME', 'BAAI/bge-small-en-v1.5')
         self.similarity_threshold = float(os.getenv('STS_SIMILARITY_THRESHOLD', '0.5'))
-        self.batch_size = int(os.getenv('STS_BATCH_SIZE', '64'))
-        self.max_workers = int(os.getenv('STS_MAX_WORKERS', '4'))
-        self.cache_ttl_minutes = int(os.getenv('STS_CACHE_TTL', '1'))
-        self.embedding_dimension = 1024 
+        self.batch_size = int(os.getenv('STS_BATCH_SIZE', '16'))  # Smaller for CPU
+        self.max_workers = int(os.getenv('STS_MAX_WORKERS', '2'))  # Fewer workers for CPU
+        self.cache_ttl_minutes = int(os.getenv('STS_CACHE_TTL', '1440'))  # 24 hours
+        self.embedding_dimension = 384  # Small model dimension
         
         self.cosine_weight = 0.75
         self.skill_weight = 0.20
@@ -291,33 +440,86 @@ class STSMetrics:
         }
 
 class JobApplicantMatcher:
-    def __init__(self, supabase_url: str, supabase_key: str, model_name: str = 'BAAI/bge-large-en-v1.5'):
-        """Initialize with Supabase connection and cosine similarity engine"""
+    def __init__(self, supabase_url: str, supabase_key: str, model_name: str = 'BAAI/bge-small-en-v1.5'):
+        """Initialize with lightweight semantic engine for Railway CPU"""
         try:
             if not supabase_url or not supabase_key:
                 raise ValueError("Supabase URL and Key must be provided")
                 
             self.supabase: Client = create_client(supabase_url, supabase_key)
             
-            self.semantic_engine = SemanticSimilarityEngine(model_name)
+            # Initialize lightweight engine
+            self.semantic_engine = None
+            self.model_name = model_name
+            self.model_initialized = False
+            self.init_lock = threading.Lock()
             
+            # Initialize caches with persistent backing
             self.job_cache = {}
             self.profile_cache = {}
             self.embedding_cache = {}
-            self.cache_ttl = timedelta(minutes=30)
-            self.batch_size = 32
-            self.max_workers = 8
+            self.cache_ttl = timedelta(minutes=60)  # Longer TTL
+            
+            # CPU-optimized settings
+            self.batch_size = 8  # Smaller batches for CPU
+            self.max_workers = 2  # Fewer concurrent workers
             
             self.metrics = STSMetrics()
             
-            logger.info(f"Initialized JobApplicantMatcher with cosine similarity engine: {model_name}")
+            # Start model initialization in background
+            self._init_model_background()
+            
+            self.active_matching_locks = {}
+            self.lock_manager = threading.Lock()
+            
+            logger.info(f"JobApplicantMatcher initialized (using lightweight model: {model_name})")
             
             self.test_connection()
-            self.active_matching_locks = {}  # Add this
-            self.lock_manager = threading.Lock()
+            
         except Exception as e:
             logger.error(f"Failed to initialize JobApplicantMatcher: {e}")
             raise
+    
+    def _init_model_background(self):
+        """Initialize model in background thread"""
+        def load_model():
+            try:
+                logger.info(f"Starting background initialization of lightweight model")
+                with self.init_lock:
+                    self.semantic_engine = LightweightSemanticEngine(self.model_name)
+                    self.model_initialized = True
+                    logger.info(f"✓ Lightweight semantic engine initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize semantic engine: {e}")
+                self.model_initialized = False
+        
+        # Start in background thread
+        threading.Thread(target=load_model, daemon=True).start()
+    
+    def ensure_engine_ready(self, timeout: int = 60) -> bool:
+        """Ensure semantic engine is ready before use"""
+        if self.model_initialized and self.semantic_engine:
+            return True
+            
+        logger.info("Waiting for semantic engine to initialize...")
+        start_time = time.time()
+        
+        while not (self.model_initialized and self.semantic_engine):
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                logger.error(f"Semantic engine initialization timeout after {timeout} seconds")
+                return False
+            
+            if int(elapsed) % 5 == 0 and int(elapsed) > 0:
+                logger.info(f"Still initializing engine... ({int(elapsed)}s elapsed)")
+            
+            time.sleep(0.5)
+        
+        # Ensure model inside engine is loaded
+        if self.semantic_engine:
+            return self.semantic_engine.ensure_model_loaded(timeout=30)
+        
+        return False
 
     def test_connection(self):
         """Test database connection"""
@@ -677,47 +879,63 @@ class JobApplicantMatcher:
             logger.error(f"Error normalizing skills: {e}")
             return []
 
-    def batch_encode_texts(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
-        """Optimized batch encoding with cosine similarity compatible embeddings"""
-        if not texts:
-            return np.array([])
-            
-        cache_key = hashlib.md5("|".join(texts).encode()).hexdigest()
-        now = datetime.now()
-        
-        if cache_key in self.embedding_cache:
-            data, timestamp = self.embedding_cache[cache_key]
-            if now - timestamp < self.cache_ttl:
-                return data
-        
-        try:
-            embeddings = []
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i + batch_size]
-                valid_batch_texts = [text for text in batch_texts if text and text.strip()]
-                
-                if not valid_batch_texts:
-                    continue
-                    
-                with torch.no_grad():
-                    batch_embeddings = self.semantic_engine.model.encode(
-                        valid_batch_texts, 
-                        convert_to_tensor=False,
-                        normalize_embeddings=True,  
-                        show_progress_bar=False,
-                        batch_size=min(batch_size, len(valid_batch_texts))
-                    )
-                embeddings.append(batch_embeddings)
-            
-            if embeddings:
-                result = np.vstack(embeddings)
-                self.embedding_cache[cache_key] = (result, now)
-                return result
-            else:
+    def batch_encode_texts(self, texts: List[str], batch_size: int = 8) -> np.ndarray:
+            """Optimized batch encoding for CPU with persistent caching"""
+            if not texts:
                 return np.array([])
-        except Exception as e:
-            logger.error(f"Error in batch encoding: {e}")
-            return np.array([])
+                
+            cache_key = hashlib.md5("|".join(texts).encode()).hexdigest()
+            now = datetime.now()
+            
+            # Check memory cache
+            if cache_key in self.embedding_cache:
+                data, timestamp = self.embedding_cache[cache_key]
+                if now - timestamp < self.cache_ttl:
+                    return data
+            
+            # Check persistent cache
+            cached_embeddings = persistent_cache.load_embeddings(cache_key)
+            if cached_embeddings is not None:
+                self.embedding_cache[cache_key] = (cached_embeddings, now)
+                return cached_embeddings
+            
+            # Ensure engine is ready
+            if not self.ensure_engine_ready():
+                logger.error("Semantic engine not ready for batch encoding")
+                return np.array([])
+            
+            try:
+                embeddings = []
+                # Smaller batches for CPU
+                for i in range(0, len(texts), batch_size):
+                    batch_texts = texts[i:i + batch_size]
+                    valid_texts = [t for t in batch_texts if t and t.strip()]
+                    
+                    if not valid_texts:
+                        continue
+                        
+                    with torch.no_grad():
+                        batch_embeddings = self.semantic_engine.model.encode(
+                            valid_texts, 
+                            convert_to_tensor=False,
+                            normalize_embeddings=True,
+                            show_progress_bar=False,
+                            batch_size=min(4, len(valid_texts))  # Very small batch for CPU
+                        )
+                    embeddings.append(batch_embeddings)
+                
+                if embeddings:
+                    result = np.vstack(embeddings)
+                    # Cache in memory
+                    self.embedding_cache[cache_key] = (result, now)
+                    # Cache persistently
+                    persistent_cache.save_embeddings(cache_key, result)
+                    return result
+                else:
+                    return np.array([])
+            except Exception as e:
+                logger.error(f"Error in batch encoding: {e}")
+                return np.array([])
 
     # ==================== NEW SKILL FILTERING METHODS ====================
 
@@ -1502,28 +1720,22 @@ class JobApplicantMatcher:
             job_level = (job_exp.get('level', '') or '').lower().strip()
             applicant_level = (applicant_exp.get('level', '') or '').lower().strip()
             
-            # If job doesn't specify level, assume any level is acceptable
             if not job_level or job_level in ['', 'any', 'not specified', 'not required']:
-                return 0.7  # Good score for unspecified requirements
+                return 0.7  
             
             job_level_score = level_mapping.get(job_level, 2) 
             applicant_level_score = level_mapping.get(applicant_level, 2)
             
-            # Calculate level compatibility
             level_diff = applicant_level_score - job_level_score
             
             if level_diff >= 0:
-                # Applicant meets or exceeds requirements - full score
                 level_score = 1.0
             else:
-                # Applicant is below requirements - penalize based on gap
-                level_score = max(0, 1.0 + (level_diff * 0.3))  # Less severe penalty
+                level_score = max(0, 1.0 + (level_diff * 0.3)) 
             
-            # Years of experience comparison
             job_years = job_exp.get('years', 0) or 0
             applicant_years = applicant_exp.get('years', 0) or 0
             
-            # Handle cases where years might be strings
             try:
                 job_years = float(job_years) if job_years else 0
                 applicant_years = float(applicant_years) if applicant_years else 0
@@ -1531,25 +1743,23 @@ class JobApplicantMatcher:
                 job_years = 0
                 applicant_years = 0
             
-            # If job doesn't specify years, be more lenient
             if job_years == 0:
                 years_score = 0.8
             else:
                 years_ratio = applicant_years / job_years if job_years > 0 else 1.0
                 if years_ratio >= 1.0:
-                    years_score = 1.0  # Meets or exceeds requirements
+                    years_score = 1.0 
                 elif years_ratio >= 0.5:
-                    years_score = 0.7  # Has at least half the required experience
+                    years_score = 0.7 
                 else:
-                    years_score = 0.3  # Significantly below requirements
+                    years_score = 0.3  
             
-            # Combine scores with emphasis on meeting minimum requirements
             experience_match = (0.5 * level_score) + (0.5 * years_score)
             return float(min(experience_match, 1.0))
             
         except Exception as e:
             logger.error(f"Error comparing experience levels: {e}")
-            return 0.5  # Neutral score on error
+            return 0.5 
     def calculate_cosine_weighted_score(self, cosine_score: float, skill_score: float, experience_score: float = 0.5) -> Dict[str, float]:
         """Calculate comprehensive weighted score with cosine similarity emphasis"""
         try:
@@ -1674,42 +1884,54 @@ class JobApplicantMatcher:
     def perform_comprehensive_cosine_matching_applicant_to_jobs(
     self, user_id: str, threshold: float = 0.5, save_to_db: bool = True
 ) -> Dict[str, Any]:
-
-    # ============================================================
-    # 🔒 LOCK CHECK — prevents duplicate simultaneous match runs
-    # ============================================================
+        """
+        Perform comprehensive cosine similarity matching for one applicant to all jobs.
+        Modified with time-based lock to prevent only rapid duplicate clicks within cooldown period.
+        Allows concurrent matching for different users and same user after cooldown.
+        """
+     
+        COOLDOWN_SECONDS = 60
+        
         with self.lock_manager:
             if user_id in self.active_matching_locks:
-                return {
-                    'matches': [],
-                    'insufficient_data': False,
-                    'message': f'Matching already in progress for user {user_id}',
-                    'total_matches': 0,
-                    'status': 'duplicate_request_blocked'
-                }
-            # Register lock for this user
+                last_request_time = self.active_matching_locks[user_id]
+                time_since_last = time.time() - last_request_time
+                
+                if time_since_last < COOLDOWN_SECONDS:
+                    remaining = int(COOLDOWN_SECONDS - time_since_last)
+                    logger.warning(f"Rate limit hit for user {user_id}. {remaining}s remaining.")
+                    return {
+                        'matches': [],
+                        'insufficient_data': False,
+                        'message': f'Please wait {remaining} seconds before matching again',
+                        'total_matches': 0,
+                        'status': 'rate_limited',
+                        'retry_after_seconds': remaining
+                    }
+            
             self.active_matching_locks[user_id] = time.time()
+            logger.info(f"Lock registered for user {user_id}")
 
-        # Make sure lock is always removed no matter what
         try:
             start_time = time.time()
 
             # ============================================================
-            # (ALL your original matching logic stays the same below)
+            # STEP 1: Fetch jobs and profile
             # ============================================================
-
             jobs = self.get_job_postings()
             profile = self.get_applicant_profile(user_id)
 
             if not jobs:
+                logger.warning("No jobs found for matching")
                 return {
                     'matches': [],
                     'insufficient_data': False,
-                    'message': 'No active job postings available',
+                    'message': 'No active job postings available for matching',
                     'total_matches': 0
                 }
 
             if not profile:
+                logger.warning(f"No profile found for user {user_id}")
                 return {
                     'matches': [],
                     'insufficient_data': True,
@@ -1717,8 +1939,13 @@ class JobApplicantMatcher:
                     'total_matches': 0
                 }
 
+            # ============================================================
+            # STEP 2: Validate profile data
+            # ============================================================
             has_sufficient_data, data_message = self.has_sufficient_profile_data(profile)
+            
             if not has_sufficient_data:
+                logger.warning(f"Applicant {user_id} has insufficient data: {data_message}")
                 return {
                     'matches': [],
                     'insufficient_data': True,
@@ -1728,9 +1955,9 @@ class JobApplicantMatcher:
 
             logger.info(f"Starting ONE-BY-ONE matching for user {user_id} with {len(jobs)} jobs")
 
-            # --------------------------
-            # STEP 1: Profile embedding
-            # --------------------------
+            # ============================================================
+            # STEP 3: Generate profile embedding ONCE
+            # ============================================================
             logger.info(f"Generating profile embedding...")
             profile_start = time.time()
             profile_text = self.create_semantic_text_representation(profile, "applicant")
@@ -1749,9 +1976,9 @@ class JobApplicantMatcher:
             matches = []
             current_time = datetime.now().isoformat()
 
-            # --------------------------
-            # STEP 2: Process each job
-            # --------------------------
+            # ============================================================
+            # STEP 4: Process each job individually
+            # ============================================================
             logger.info(f"Processing {len(jobs)} jobs one at a time...")
 
             for job_idx, job in enumerate(jobs):
@@ -1783,26 +2010,41 @@ class JobApplicantMatcher:
                         logger.info(f"[{job_num}/{len(jobs)}] Below threshold — Skipping")
                         continue
 
-                    # 3–6: Additional semantic scores
+                    # 3. Skill score
                     skill_score = self.calculate_semantic_skill_similarity(
                         job.get('requirements', []),
                         profile.get('skills', [])
                     )
-                    experience_score = self.calculate_experience_similarity(job, profile)
-                    description_score = self.calculate_description_similarity(job, profile)
+                    logger.debug(f"[{job_num}/{len(jobs)}] Skill score: {skill_score:.4f}")
 
-                    # 7. Weighted final score
+                    # 4. Experience score
+                    experience_score = self.calculate_experience_similarity(job, profile)
+                    if experience_score is not None:
+                        logger.debug(f"[{job_num}/{len(jobs)}] Experience score: {experience_score:.4f}")
+                    else:
+                        logger.debug(f"[{job_num}/{len(jobs)}] Experience score: N/A")
+
+                    # 5. Description score
+                    description_score = self.calculate_description_similarity(job, profile)
+                    logger.debug(f"[{job_num}/{len(jobs)}] Description score: {description_score:.4f}")
+
+                    # 6. Weighted final score
                     scores = self.calculate_enhanced_weighted_score(
                         cosine_score, skill_score, experience_score, description_score,
                         job=job, profile=profile
                     )
                     final_score = scores['similarity_score']
+                    logger.info(f"[{job_num}/{len(jobs)}] Final weighted score: {final_score:.4f}")
 
                     if final_score < threshold:
+                        logger.info(f"[{job_num}/{len(jobs)}] Final score below threshold — Skipping")
                         continue
 
+                    # 7. Determine match strength
                     match_strength = self.get_cosine_match_strength(final_score)
+                    logger.info(f"[{job_num}/{len(jobs)}] Match strength: {match_strength}")
 
+                    # 8. Build match data
                     match_data = {
                         'job_id': job_id,
                         'applicant_id': user_id,
@@ -1820,41 +2062,60 @@ class JobApplicantMatcher:
 
                     matches.append(match_data)
 
-                    # 8. Save to DB (one by one)
+                    # 9. Save to DB individually
                     if save_to_db:
-                        match_entry = {
-                            'applicant_id': user_id,
-                            'job_id': job_id,
-                            'similarity_score': float(scores['similarity_score']),
-                            'cosine_score': float(scores['cosine_score']),
-                            'skill_score': float(scores['skill_score']),
-                            'description_score': float(scores.get('description_score', 0.0)),
-                            'match_strength': match_strength,
-                            'updated_at': current_time,
-                            'created_at': current_time
-                        }
+                        try:
+                            logger.info(f"[{job_num}/{len(jobs)}] Saving match to database...")
+                            
+                            match_entry = {
+                                'applicant_id': user_id,
+                                'job_id': job_id,
+                                'similarity_score': float(scores['similarity_score']),
+                                'cosine_score': float(scores['cosine_score']),
+                                'skill_score': float(scores['skill_score']),
+                                'description_score': float(scores.get('description_score', 0.0)),
+                                'match_strength': match_strength,
+                                'updated_at': current_time,
+                                'created_at': current_time
+                            }
 
-                        if scores.get('experience_score') is not None:
-                            match_entry['experience_score'] = float(scores['experience_score'])
+                            # Only add experience_score if it's not None
+                            if scores.get('experience_score') is not None:
+                                match_entry['experience_score'] = float(scores['experience_score'])
 
-                        self.supabase.table('job_match_notification').upsert(match_entry).execute()
+                            # Individual save
+                            result = self.supabase.table('job_match_notification').upsert(match_entry).execute()
+                            
+                            if hasattr(result, 'error') and result.error:
+                                logger.error(f"[{job_num}/{len(jobs)}] ✗ Database error: {result.error}")
+                            else:
+                                logger.info(f"[{job_num}/{len(jobs)}] ✓ Match saved successfully")
+                                
+                        except Exception as save_error:
+                            logger.error(f"[{job_num}/{len(jobs)}] ✗ Failed to save: {save_error}")
+
+                    logger.info(f"[{job_num}/{len(jobs)}] ✓ COMPLETED: '{job_title}' - Score: {final_score:.4f}\n")
 
                 except Exception as job_error:
-                    logger.error(f"[{job_num}/{len(jobs)}] ERROR processing job: {job_error}")
+                    logger.error(f"[{job_num}/{len(jobs)}] ✗ ERROR processing job: {job_error}\n")
                     continue
 
-            # --------------------------
-            # STEP 3: Final sorting
-            # --------------------------
+            # ============================================================
+            # STEP 5: Sort and calibrate matches
+            # ============================================================
+            logger.info(f"Sorting and calibrating {len(matches)} matches...")
             sorted_matches = sorted(matches, key=lambda x: x['scores']['similarity_score'], reverse=True)
             calibrated = self.calibrate_match_scores(sorted_matches)
+
+            processing_time = time.time() - start_time
+            logger.info(f"✓ Matching completed in {processing_time:.2f}s. Found {len(calibrated)} matches.")
 
             return {
                 'matches': calibrated,
                 'insufficient_data': False,
                 'message': f'Found {len(calibrated)} matches with one-by-one processing',
                 'total_matches': len(calibrated),
-                'processing_time': time.time() - start_time,
+                'processing_time': processing_time,
                 'scoring_method': 'one_by_one_individual_embeddings'
             }
 
@@ -1869,10 +2130,22 @@ class JobApplicantMatcher:
 
         finally:
             # ============================================================
-            # 🔓 ALWAYS RELEASE LOCK
+            # 🔓 ALWAYS CLEAN UP OLD LOCKS (keep last 100 entries)
             # ============================================================
             with self.lock_manager:
-                self.active_matching_locks.pop(user_id, None)
+                # Clean up old locks periodically to prevent memory bloat
+                if len(self.active_matching_locks) > 100:
+                    logger.info(f"Cleaning up old locks. Current count: {len(self.active_matching_locks)}")
+                    
+                    # Sort by timestamp (newest first) and keep only recent 100
+                    sorted_locks = sorted(
+                        self.active_matching_locks.items(), 
+                        key=lambda x: x[1], 
+                        reverse=True
+                    )
+                    self.active_matching_locks = dict(sorted_locks[:100])
+                    
+                    logger.info(f"Locks cleaned up. New count: {len(self.active_matching_locks)}")
 
     def _get_description_analysis(self, description_score: float) -> str:
         """Provide interpretation of description matching"""
@@ -2677,8 +2950,50 @@ class ResourceAwareMatcher(JobApplicantMatcher):
                 logger.warning(f"Batch encoding attempt {attempt + 1} failed, retrying in {wait_time:.2f}s: {e}")
                 time.sleep(wait_time)
 
+# ==================== APPLICATION STARTUP OPTIMIZATION ====================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Initialize matcher in background to prevent cold start blocking
+matcher = None
+matcher_initialization_started = False
+
+def initialize_matcher_background():
+    """Initialize matcher in background thread"""
+    global matcher, matcher_initialization_started
+    
+    if matcher_initialization_started:
+        return
+    
+    matcher_initialization_started = True
+    logger.info("Starting background matcher initialization...")
+    
+    try:
+        # Initialize with lightweight model
+        global_matcher = JobApplicantMatcher(
+            SUPABASE_URL, 
+            SUPABASE_KEY, 
+            'BAAI/bge-small-en-v1.5'  # Use small model
+        )
+        
+        # Try to warm up the engine
+        try:
+            engine_ready = global_matcher.ensure_engine_ready(timeout=90)
+            if engine_ready:
+                logger.info("✓ Matcher initialized and warmed up successfully")
+            else:
+                logger.warning("Matcher initialized but warmup incomplete")
+        except Exception as warmup_error:
+            logger.error(f"Matcher warmup failed: {warmup_error}")
+        
+        matcher = global_matcher
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize matcher in background: {e}")
+        matcher = None
+
+# Start background initialization immediately
+threading.Thread(target=initialize_matcher_background, daemon=True).start()
 
 try:
     matcher = JobApplicantMatcher(SUPABASE_URL, SUPABASE_KEY, 'BAAI/bge-large-en-v1.5')
@@ -3195,20 +3510,6 @@ def get_matching_history():
         logger.error(f"Error getting matching history: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'success': True,
-        'status': 'healthy',
-        'matcher_initialized': matcher is not None,
-        'matching_engine': 'comprehensive_cosine_similarity',
-        'supported_directions': ['one_applicant_to_all_jobs', 'one_job_to_all_applicants'],
-        'tables_used': {
-            'one_applicant_to_all_jobs': 'job_match_notification',
-            'one_job_to_all_applicants': 'applicant_match'
-        }
-    })
 
 @app.route('/api/clear-cache', methods=['POST'])
 def clear_cache():
@@ -3254,6 +3555,86 @@ def get_my_matches():
 def get_stats():
     """Get matching statistics (backward compatibility)"""
     return get_cosine_stats()
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Detailed health check with model status"""
+    health_data = {
+        'success': True,
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'system': {
+            'python_version': sys.version,
+            'platform': platform.platform()
+        },
+        'matcher': {
+            'initialized': matcher is not None,
+            'model_status': 'unknown'
+        },
+        'cache': {
+            'persistent_enabled': True,
+            'cache_dir': persistent_cache.cache_dir
+        }
+    }
+    
+    if matcher:
+        # Check model status
+        model_ready = False
+        if hasattr(matcher, 'model_initialized'):
+            model_ready = matcher.model_initialized
+            if matcher.semantic_engine:
+                model_ready = model_ready and matcher.semantic_engine.model_loaded
+        
+        health_data['matcher'].update({
+            'model_status': 'ready' if model_ready else 'loading',
+            'model_initialized': matcher.model_initialized if hasattr(matcher, 'model_initialized') else False,
+            'engine_ready': bool(matcher.semantic_engine),
+            'model_loaded': matcher.semantic_engine.model_loaded if matcher.semantic_engine else False,
+            'model_name': matcher.model_name if hasattr(matcher, 'model_name') else 'unknown'
+        })
+    
+    return jsonify(health_data)
 
+@app.route('/api/warmup', methods=['POST'])
+def warmup():
+    """Force warmup of the system"""
+    if not matcher:
+        return jsonify({'success': False, 'error': 'Matcher not initialized yet'}), 503
+    
+    try:
+        engine_ready = matcher.ensure_engine_ready(timeout=120)
+        
+        if engine_ready and matcher.semantic_engine:
+            test_embedding = matcher.semantic_engine.get_semantic_embedding("test warmup")
+            test_success = test_embedding is not None and test_embedding.size > 0
+        else:
+            test_success = False
+        
+        return jsonify({
+            'success': True,
+            'engine_ready': engine_ready,
+            'test_embedding_generated': test_success,
+            'message': 'Warmup completed' if engine_ready else 'Warmup in progress'
+        })
+        
+    except Exception as e:
+        logger.error(f"Warmup failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Warmup failed'
+        }), 500
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    if matcher:
+        logger.info("Attempting final warmup before serving...")
+        try:
+            matcher.ensure_engine_ready(timeout=30)
+        except Exception as e:
+            logger.warning(f"Final warmup incomplete: {e}")
+    
+    app.run(
+        host='0.0.0.0', 
+        port=5000, 
+        debug=False,
+        threaded=True,
+        processes=1 
+    )
