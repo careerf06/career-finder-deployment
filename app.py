@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import profile
 import random
 import sys
 import threading
@@ -302,19 +303,15 @@ class LightweightSemanticEngine:
             return np.zeros(384, dtype=np.float32)
     
     def manual_cosine_similarity(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
-        """Manual cosine similarity optimized for CPU"""
         try:
             if embedding1.size == 0 or embedding2.size == 0:
                 return 0.0
             
-            # Flatten arrays
             embedding1 = embedding1.flatten()
             embedding2 = embedding2.flatten()
             
-            # Use min dimensions for speed
             min_dim = min(embedding1.shape[0], embedding2.shape[0])
             
-            # Use numpy operations which are CPU-optimized
             dot_product = np.dot(embedding1[:min_dim], embedding2[:min_dim])
             norm1 = np.linalg.norm(embedding1[:min_dim])
             norm2 = np.linalg.norm(embedding2[:min_dim])
@@ -391,13 +388,12 @@ class STSConfig:
     """Configuration for Semantic Textual Similarity system"""
     
     def __init__(self):
-        # Use smaller model for CPU optimization
         self.model_name = os.getenv('STS_MODEL_NAME', 'BAAI/bge-small-en-v1.5')
         self.similarity_threshold = float(os.getenv('STS_SIMILARITY_THRESHOLD', '0.5'))
-        self.batch_size = int(os.getenv('STS_BATCH_SIZE', '16'))  # Smaller for CPU
-        self.max_workers = int(os.getenv('STS_MAX_WORKERS', '2'))  # Fewer workers for CPU
-        self.cache_ttl_minutes = int(os.getenv('STS_CACHE_TTL', '1440'))  # 24 hours
-        self.embedding_dimension = 384  # Small model dimension
+        self.batch_size = int(os.getenv('STS_BATCH_SIZE', '16'))  
+        self.max_workers = int(os.getenv('STS_MAX_WORKERS', '2'))  
+        self.cache_ttl_minutes = int(os.getenv('STS_CACHE_TTL', '1440'))  
+        self.embedding_dimension = 384 
         
         self.cosine_weight = 0.75
         self.skill_weight = 0.20
@@ -719,9 +715,7 @@ class JobApplicantMatcher:
     def calculate_enhanced_weighted_score(self, cosine_score: float, skill_score: float, 
                              experience_score: float, description_score: float,
                              job: Dict = None, profile: Dict = None) -> Dict[str, float]:
-        """
-        Adaptive weighted score based on job requirements complexity
-        """
+       
         try:
             # Determine job complexity
             has_many_requirements = False
@@ -783,7 +777,6 @@ class JobApplicantMatcher:
                 )
                 experience_score_output = None
             
-            # Apply sigmoid transformation for better score distribution
             def sigmoid_transform(score):
                 """Spread scores better across 0-1 range"""
                 return 1 / (1 + np.exp(-8 * (score - 0.5)))
@@ -791,10 +784,10 @@ class JobApplicantMatcher:
             transformed_score = sigmoid_transform(primary_score)
             
             return {
-                'similarity_score': float(max(0.0, min(1.0, transformed_score))),
-                'cosine_score': float(max(0.0, min(1.0, cosine_score))),
-                'skill_score': float(max(0.0, min(1.0, skill_score))),
-                'description_score': float(max(0.0, min(1.0, description_score))),
+                'similarity_score': float(max(0.0, transformed_score)),
+                'cosine_score': float(max(0.0, cosine_score)),
+                'skill_score': float(max(0.0, skill_score)),
+                'description_score': float(max(0.0, description_score)),
                 'experience_score': experience_score_output,
                 'weights_used': weights,
                 'raw_score': float(primary_score)
@@ -810,34 +803,44 @@ class JobApplicantMatcher:
             }
     def create_semantic_text_representation(self, profile: Dict, entity_type: str = "applicant", job: Dict = None) -> str:
         """
-        OPTIMIZED: Faster text creation with length limits
+        Create semantic text representation using new skills and experience fields
         """
         try:
             if entity_type == "applicant":
-                # Fast skill normalization
+                # Applicant side remains the same
                 skills = profile.get('skills', []) or []
                 if isinstance(skills, str):
                     skills = json.loads(skills) if skills.startswith('[') else skills.split(',')
                 
-                # Limit to 15 skills for speed
                 skills_clean = [str(s).strip().lower() for s in skills[:15] if s]
-                
-                # Limit description length
                 description = str(profile.get('description', '') or '')[:500]
                 
                 return f"Description: {description} | Skills: {', '.join(skills_clean)}"
                 
             else:  # job
-                requirements = profile.get('requirements', []) or []
-                if isinstance(requirements, str):
-                    requirements = json.loads(requirements) if requirements.startswith('[') else requirements.split(',')
+                # Use dedicated skills field instead of requirements
+                skills = profile.get('skills', []) or []
+                if isinstance(skills, str):
+                    skills = json.loads(skills) if skills.startswith('[') else skills.split(',')
                 
-                # Limit to 12 requirements
-                req_clean = [str(r).strip().lower() for r in requirements[:12] if r]
+                # Fallback to requirements if skills is empty
+                if not skills:
+                    skills = profile.get('requirements', []) or []
+                    if isinstance(skills, str):
+                        skills = json.loads(skills) if skills.startswith('[') else skills.split(',')
                 
+                skills_clean = [str(s).strip().lower() for s in skills[:12] if s]
                 description = str(profile.get('description', '') or '')[:500]
                 
-                return f"Description: {description} | Requirements: {', '.join(req_clean)}"
+                # Include experience requirement in representation
+                experience_req = float(profile.get('experience_required', 0) or 0)
+                exp_text = f"Experience: {experience_req} years" if experience_req > 0 else ""
+                
+                parts = [f"Description: {description}", f"Skills: {', '.join(skills_clean)}"]
+                if exp_text:
+                    parts.append(exp_text)
+                
+                return " | ".join(parts)
                 
         except Exception as e:
             logger.error(f"Error creating text representation: {e}")
@@ -878,7 +881,32 @@ class JobApplicantMatcher:
         except Exception as e:
             logger.error(f"Error normalizing skills: {e}")
             return []
+    def _extract_job_skills(self, job: Dict) -> List[str]:
+        """Extract skills from job posting with priority on new skills field"""
+        # Prioritize dedicated skills field over requirements
+        job_skills = job.get('skills', []) or []
+        
+        if job_skills:
+            if isinstance(job_skills, str):
+                job_skills = json.loads(job_skills) if job_skills.startswith('[') else job_skills.split(',')
+            return self._normalize_skills(job_skills)
+        
+        # Fallback to requirements if skills field is empty
+        requirements = job.get('requirements', []) or []
+        return self._normalize_skills(requirements)
 
+    def _infer_level_from_years(self, years: float) -> str:
+        """Infer experience level from years required"""
+        if years == 0:
+            return 'entry'
+        elif years <= 2:
+            return 'junior'
+        elif years <= 5:
+            return 'mid'
+        elif years <= 8:
+            return 'senior'
+        else:
+            return 'expert'
     def batch_encode_texts(self, texts: List[str], batch_size: int = 8) -> np.ndarray:
             """Optimized batch encoding for CPU with persistent caching"""
             if not texts:
@@ -1681,9 +1709,12 @@ class JobApplicantMatcher:
                 else:
                     requirements_text = str(requirements)
             
+            # Use the new experience_required field (double precision/float)
+            years_required = float(job.get('experience_required', 0) or 0)
+            
             experience_info = {
-                'level': job.get('experience_level', '') or '',
-                'years': job.get('years_experience', 0) or 0,
+                'level': job.get('experience_level', '') or self._infer_level_from_years(years_required),
+                'years': years_required,  # Now directly from experience_required field
                 'description': f"{description} {requirements_text}".strip(),
                 'type': job.get('job_type', '') or ''
             }
@@ -1691,21 +1722,24 @@ class JobApplicantMatcher:
         except Exception as e:
             logger.error(f"Error extracting experience from job: {e}")
             return {'level': '', 'years': 0, 'description': '', 'type': ''}
-        
     def _extract_experience_from_profile(self, profile: Dict) -> Dict:
         """Extract experience information from applicant profile with proper None handling"""
         try:
             description = profile.get('description', '') or ''
             
+            years = profile.get('experience', 0) or 0
+            
+            level = self._infer_level_from_years(years)
+            
             experience_info = {
-                'level': profile.get('experience_level', '') or '',
-                'years': profile.get('years_of_experience', 0) or 0,
+                'level': level,
+                'years': years,
                 'description': f"{description}".strip(),
             }
             return experience_info
         except Exception as e:
             logger.error(f"Error extracting experience from profile: {e}")
-            return {'level': '', 'years': 0, 'description': '', 'companies': ''}
+            return {'level': '', 'years': 0, 'description': ''}
 
     def _compare_experience_levels(self, job_exp: Dict, applicant_exp: Dict) -> float:
         """Compare experience levels and years with enhanced logic"""
@@ -1761,15 +1795,14 @@ class JobApplicantMatcher:
             logger.error(f"Error comparing experience levels: {e}")
             return 0.5 
     def calculate_cosine_weighted_score(self, cosine_score: float, skill_score: float, experience_score: float = 0.5) -> Dict[str, float]:
-        """Calculate comprehensive weighted score with cosine similarity emphasis"""
         try:
             primary_score = (0.75 * cosine_score) + (0.20 * skill_score) + (0.05 * experience_score)
             
             return {
-                'similarity_score': float(max(0.0, min(1.0, primary_score))),
-                'cosine_score': float(max(0.0, min(1.0, cosine_score))),
-                'skill_score': float(max(0.0, min(1.0, skill_score))),
-                'experience_score': float(max(0.0, min(1.0, experience_score)))
+                'similarity_score': float(max(0.0, primary_score)),
+                'cosine_score': float(max(0.0, cosine_score)),
+                'skill_score': float(max(0.0, skill_score)),
+                'experience_score': float(max(0.0, experience_score))
             }
         except Exception as e:
             logger.error(f"Error calculating cosine weighted score: {e}")
@@ -1840,11 +1873,10 @@ class JobApplicantMatcher:
                     score_changed = abs(current_score - previous_score) > 0.01  
                 
                 if not existing_match or score_changed:
-                    similarity_score = max(0.0, min(1.0, match['scores']['similarity_score']))
-                    cosine_score = max(0.0, min(1.0, match['scores']['cosine_score']))
-                    skill_score = max(0.0, min(1.0, match['scores']['skill_score']))
-                    experience_score = max(0.0, min(1.0, match['scores'].get('experience_score', 0.0)))
-                    
+                    similarity_score = max(0.0, match['scores']['similarity_score'])
+                    cosine_score = max(0.0, match['scores']['cosine_score'])
+                    skill_score = max(0.0, match['scores']['skill_score'])
+                    experience_score = max(0.0, match['scores'].get('experience_score', 0.0))
                     match_entry = {
                         'applicant_id': match.get('applicant_id', user_id),
                         'job_id': match.get('job_id', job_id),
@@ -2036,8 +2068,10 @@ class JobApplicantMatcher:
                         logger.info(f"[{job_num}/{len(jobs)}] Below threshold — Skipping")
                         continue
 
+                    # Extract job skills using the new dedicated field
+                    job_skills = self._extract_job_skills(job)
                     skill_score = self.calculate_semantic_skill_similarity(
-                        job.get('requirements', []),
+                        job_skills,
                         profile.get('skills', [])
                     )
                     logger.debug(f"[{job_num}/{len(jobs)}] Skill score: {skill_score:.4f}")
@@ -2438,9 +2472,11 @@ class JobApplicantMatcher:
                 
                 try:
                     # Calculate additional scores
+                    # Extract job skills using the new dedicated field
+                    job_skills = self._extract_job_skills(job)
                     skill_score = self.calculate_semantic_skill_similarity(
-                        job.get('requirements', []),
-                        applicant.get('skills', [])
+                        job_skills,
+                        applicant.get('skills', [])  # ✅ FIXED: Changed from 'profile' to 'applicant'
                     )
                     logger.debug(f"[{applicant_num}/{len(valid_applicants)}] Skill score: {skill_score:.4f}")
                     
@@ -2452,7 +2488,6 @@ class JobApplicantMatcher:
                     
                     description_score = self.calculate_description_similarity(job, applicant)
                     logger.debug(f"[{applicant_num}/{len(valid_applicants)}] Description score: {description_score:.4f}")
-                    
                     # Calculate weighted score
                     scores = self.calculate_enhanced_weighted_score(
                         cosine_score, skill_score, experience_score, description_score,
@@ -2577,7 +2612,7 @@ class JobApplicantMatcher:
                 score_changed = abs(current_score - previous_score) > 0.01  
             
             if not existing_match or score_changed:
-                similarity_score = max(0.0, min(1.0, match['scores']['similarity_score']))
+                similarity_score = max(0.0, re.match['scores']['similarity_score'])
                 cosine_score = max(0.0, min(1.0, match['scores']['cosine_score']))
                 skill_score = max(0.0, min(1.0, match['scores']['skill_score']))
                 experience_score_raw = match['scores'].get('experience_score')
@@ -2594,7 +2629,7 @@ class JobApplicantMatcher:
                 
                 # Only add experience_score if it's not None
                 if experience_score_raw is not None:
-                    match_entry['experience_score'] = float(max(0.0, min(1.0, experience_score_raw)))
+                    match_entry['experience_score'] = float(max(0.0, experience_score_raw))
                 # If None, don't include the key (will be NULL in database)
                 
                 if not existing_match:
